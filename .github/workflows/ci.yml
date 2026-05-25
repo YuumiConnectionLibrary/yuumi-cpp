@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-amd64
+            os: windows-latest
+            configure-preset: windows-msvc-debug
+            build-preset: windows-msvc-debug-build
+            compiler_launcher: sccache
+          - label: linux-amd64
+            os: ubuntu-latest
+            configure-preset: linux-clang-debug
+            build-preset: linux-clang-debug-build
+            compiler_launcher: ccache
+          - label: macos-arm64
+            os: macos-latest
+            configure-preset: macos-clang-debug
+            build-preset: macos-clang-debug-build
+            compiler_launcher: ccache
+
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+      VCPKG_FEATURE_FLAGS: manifests,binarycaching
+      CMAKE_C_COMPILER_LAUNCHER: ${{ matrix.compiler_launcher }}
+      CMAKE_CXX_COMPILER_LAUNCHER: ${{ matrix.compiler_launcher }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ${{ github.workspace }}/.vcpkg-cache
+            ${{ github.workspace }}/vcpkg/downloads
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: ${{ runner.os }}-vcpkg-
+
+      - name: Ensure vcpkg cache directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path "${{ github.workspace }}/.vcpkg-cache" -Force | Out-Null
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c
+        with:
+          arch: amd64
+
+      - name: Setup sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a
+        with:
+          version: v0.7.7
+
+      - name: Setup Unix toolchain
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y build-essential cmake ninja-build curl zip unzip tar pkg-config ccache clang
+          else
+            brew install cmake ninja ccache
+          fi
+
+      - name: Configure vcpkg environment
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=${{ github.workspace }}/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Bootstrap vcpkg (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.configure-preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.build-preset }}
+
+# creato: 2026-05-25 | CI GitHub Actions | yuumi-cpp
