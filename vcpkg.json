@@ -1,8 +1,8 @@
 {
   "name": "yuumi",
   "version": "0.1.0",
-  "description": "C++ header-only IPC bridge library",
-  "builtin-baseline": "5370dfcd20a1baff0bd387c9f65eb45839b986cc",
+  "description": "C++ server-side SDK for the Yuumi IPC protocol",
+  "builtin-baseline": "d015e31e90838a4c9dfa3eed45979bc70d9357fc",
   "dependencies": [
     "asio",
     "nlohmann-json"

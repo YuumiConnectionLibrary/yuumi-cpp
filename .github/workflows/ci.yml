@@ -52,6 +52,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Ensure vcpkg checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d vcpkg ]]; then
+            git clone https://github.com/microsoft/vcpkg vcpkg
+            git -C vcpkg checkout d015e31e90838a4c9dfa3eed45979bc70d9357fc
+          fi
+
       - name: Restore vcpkg binary cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
         with:

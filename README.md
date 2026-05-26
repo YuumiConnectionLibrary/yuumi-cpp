@@ -1,8 +1,8 @@
 # yuumi-cpp
 
-[![CI](https://github.com/ilmartotch/yuumi-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/ilmartotch/yuumi-cpp/actions/workflows/ci.yml)
+[![CI](https://github.com/YuumiConnectionLibrary/yuumi-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/YuumiConnectionLibrary/yuumi-cpp/actions/workflows/ci.yml)
 
-> C++23 header-only implementation of the [Yuumi IPC protocol](https://github.com/ilmartotch/yuumi-spec).
+> C++23 server-side SDK for the [Yuumi IPC protocol](https://github.com/YuumiConnectionLibrary/yuumi-spec).
 
 ## Requirements
 
@@ -14,7 +14,7 @@
 
 ```bash
 # Clone with vcpkg as submodule
-git clone --recurse-submodules https://github.com/ilmartotch/yuumi-cpp
+git clone --recurse-submodules https://github.com/YuumiConnectionLibrary/yuumi-cpp
 
 # Build (choose preset for your platform)
 cmake --preset linux-clang-debug
@@ -31,7 +31,26 @@ If `VCPKG_ROOT` is set in your environment, CMake uses it automatically.
 
 ## Wire protocol
 
-See [yuumi-spec](https://github.com/ilmartotch/yuumi-spec) for the canonical wire format definition.
+See [yuumi-spec](https://github.com/YuumiConnectionLibrary/yuumi-spec) for the canonical wire format definition.
+
+## Server usage
+
+```cpp
+#include <yuumi/bridge.hpp>
+
+yuumi::ServerBridge bridge;
+bridge.on_message([](const yuumi::Json& payload, yuumi::Channel ch) {
+    // business logic here
+});
+bridge.on_error([](yuumi::Error err) {
+    // transport / protocol error handling
+});
+
+auto started = bridge.start("my-service", 0);
+if (!started) {
+    return 1;
+}
+```
 
 ## Dependencies (via vcpkg)
 

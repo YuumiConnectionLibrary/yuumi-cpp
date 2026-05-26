@@ -12,7 +12,7 @@ endif()
 
 project(yuumi
     VERSION 0.1.0
-    DESCRIPTION "Yuumi — C++/Go IPC bridge library"
+    DESCRIPTION "Yuumi C++ server SDK"
     LANGUAGES CXX
 )
 
@@ -45,21 +45,8 @@ target_link_libraries(yuumi_cpp INTERFACE
 
 option(YUUMI_BUILD_TESTS "Build Yuumi test applications" ON)
 
-if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/tester.cpp")
-    add_executable(yuumi_tester tests/cpp/tester.cpp)
-    target_link_libraries(yuumi_tester PRIVATE yuumi::cpp)
-
-    if(MSVC)
-        target_compile_options(yuumi_tester PRIVATE /W4 /permissive-)
-    else()
-        target_compile_options(yuumi_tester PRIVATE -Wall -Wextra -pedantic)
-    endif()
-
-    message(STATUS "Yuumi test runner enabled.")
-endif()
-
-if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/path_check.cpp")
-    add_executable(yuumi_path_check tests/cpp/path_check.cpp)
+if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/path_check.cpp")
+    add_executable(yuumi_path_check tests/path_check.cpp)
     target_link_libraries(yuumi_path_check PRIVATE yuumi::cpp)
 
     if(MSVC)
