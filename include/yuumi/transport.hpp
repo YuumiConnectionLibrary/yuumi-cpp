@@ -52,3 +52,10 @@ namespace yuumi {
         SocketType _socket;
     };
 }
+
+/*
+ * transport.hpp: Local IPC transport primitives for the C++ bridge.
+ * - Normalizes transport addresses from pipe names using the system temp directory.
+ * - Listens on a local stream socket and accepts a single client connection.
+ * - Exposes the accepted socket for protocol read/write operations.
+ */

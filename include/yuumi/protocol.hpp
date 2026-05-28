@@ -18,7 +18,6 @@ namespace yuumi {
             Encrypted  = 1 << 1
         };
 
-        // Serializes a Json value to a Yuumi frame using the specified encoding.
         static std::vector<std::byte> encode(const Json& j, Channel ch, Encoding enc = Encoding::MsgPack) {
             std::vector<uint8_t> raw;
             if (enc == Encoding::MsgPack) {
@@ -27,9 +26,8 @@ namespace yuumi {
                 const std::string s = j.dump();
                 raw.assign(s.begin(), s.end());
             }
-
             uint32_t length = static_cast<uint32_t>(raw.size());
-            // BigEndian on the wire
+            uint32_t length = static_cast<uint32_t>(raw.size());
             uint32_t wire_length = (std::endian::native == std::endian::little) ? std::byteswap(length) : length;
 
             std::vector<std::byte> packet(6 + raw.size());
@@ -41,7 +39,6 @@ namespace yuumi {
             return packet;
         }
 
-        // Deserializes a raw frame body to a Json value using the specified encoding.
         static Result<Json> decode(std::span<const std::byte> buffer, Encoding enc = Encoding::MsgPack) {
             try {
                 if (enc == Encoding::MsgPack) {
@@ -54,7 +51,6 @@ namespace yuumi {
             }
         }
 
-        // Validates the presence of required keys in a Json object.
         static bool validate_schema(const Json& j, std::initializer_list<std::string_view> required_keys) {
             for (auto key : required_keys) {
                 if (!j.contains(key)) return false;
@@ -63,3 +59,10 @@ namespace yuumi {
         }
     };
 }
+
+/*
+ * protocol.hpp: C++ frame codec utilities for Yuumi.
+ * - Encodes JSON objects into framed byte payloads with fixed 6-byte headers.
+ * - Decodes payload buffers from JSON or MsgPack into typed Json objects.
+ * - Provides lightweight schema-key presence validation for inbound/outbound contracts.
+ */

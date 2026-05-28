@@ -41,14 +41,11 @@ namespace yuumi {
     template <typename T = void>
     using Result = std::expected<T, Error>;
 
-    // Encoding negotiated during handshake. Server selects one from client capabilities.
     enum class Encoding : uint8_t {
         JSON    = 0x01,
         MsgPack = 0x02
     };
 
-    // 16-byte handshake sent by the client (BigEndian fields).
-    // Layout: [4B magic][4B version][4B PID][1B encoding_caps][3B reserved]
     struct Handshake {
         uint32_t magic    = 0x59554d49;
         uint32_t version  = PROTOCOL_VERSION;
