@@ -51,7 +51,11 @@ namespace yuumi {
             _queue_cv.notify_all();
             for (auto& thread : _io_threads) {
                 if (thread.joinable()) {
-                    thread.join();
+                    if (thread.get_id() == std::this_thread::get_id()) {
+                        thread.detach();
+                    } else {
+                        thread.join();
+                    }
                 }
             }
             _io_threads.clear();
@@ -161,10 +165,6 @@ namespace yuumi {
                 asio::read(_transport.socket(), asio::buffer(body), ec);
                 if (ec) {
                     break;
-                }
-
-                if (channel == Channel::Control) {
-                    continue;
                 }
 
                 auto decoded = Protocol::decode(body, _encoding);

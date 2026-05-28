@@ -44,6 +44,7 @@ target_link_libraries(yuumi_cpp INTERFACE
 )
 
 option(YUUMI_BUILD_TESTS "Build Yuumi test applications" ON)
+option(YUUMI_BUILD_EXAMPLES "Build Yuumi example applications" ON)
 
 if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/path_check.cpp")
     add_executable(yuumi_path_check tests/path_check.cpp)
@@ -56,6 +57,19 @@ if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/path_check.cp
     endif()
 
     message(STATUS "Yuumi path-check tool enabled.")
+endif()
+
+if(YUUMI_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp_server/main.cpp")
+    add_executable(yuumi_cpp_server examples/cpp_server/main.cpp)
+    target_link_libraries(yuumi_cpp_server PRIVATE yuumi::cpp)
+
+    if(MSVC)
+        target_compile_options(yuumi_cpp_server PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(yuumi_cpp_server PRIVATE -Wall -Wextra -pedantic)
+    endif()
+
+    message(STATUS "Yuumi cpp_server example enabled.")
 endif()
 
 message(STATUS "yuumi v${PROJECT_VERSION} configured successfully.")
