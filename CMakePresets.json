@@ -60,5 +60,20 @@
       "name": "macos-clang-debug-build",
       "configurePreset": "macos-clang-debug"
     }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-msvc-debug-test",
+      "configurePreset": "windows-msvc-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "linux-clang-debug-test",
+      "configurePreset": "linux-clang-debug"
+    },
+    {
+      "name": "macos-clang-debug-test",
+      "configurePreset": "macos-clang-debug"
+    }
   ]
 }

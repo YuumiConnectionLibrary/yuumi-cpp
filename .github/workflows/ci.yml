@@ -52,6 +52,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Checkout canonical specification
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: YuumiConnectionLibrary/yuumi-spec
+          ref: dev
+          path: yuumi-spec
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Ensure vcpkg checkout
         shell: bash
         run: |
@@ -116,9 +125,12 @@ jobs:
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       - name: Configure
-        run: cmake --preset ${{ matrix.configure-preset }}
+        run: cmake --preset ${{ matrix.configure-preset }} -DYUUMI_SPEC_DIR=${{ github.workspace }}/yuumi-spec
 
       - name: Build
         run: cmake --build --preset ${{ matrix.build-preset }}
+
+      - name: Engine conformance
+        run: ctest --preset ${{ matrix.configure-preset }}-test --output-on-failure
 
 # creato: 2026-05-25 | CI GitHub Actions | yuumi-cpp

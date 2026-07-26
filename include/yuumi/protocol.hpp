@@ -1,68 +1,148 @@
 #pragma once
+
 #include <yuumi/types.hpp>
-#include <nlohmann/json.hpp>
+
 #include <bit>
-#include <span>
-#include <vector>
 #include <cstring>
+#include <span>
+#include <utility>
+#include <vector>
 
 namespace yuumi {
 
-    using Json = nlohmann::json;
-
-    class Protocol {
-    public:
-        enum Flags : uint8_t {
-            None       = 0,
-            Compressed = 1 << 0,
-            Encrypted  = 1 << 1
-        };
-
-        static std::vector<std::byte> encode(const Json& j, Channel ch, Encoding enc = Encoding::MsgPack) {
-            std::vector<uint8_t> raw;
-            if (enc == Encoding::MsgPack) {
-                raw = Json::to_msgpack(j);
-            } else {
-                const std::string s = j.dump();
-                raw.assign(s.begin(), s.end());
-            }
-            uint32_t length = static_cast<uint32_t>(raw.size());
-            uint32_t length = static_cast<uint32_t>(raw.size());
-            uint32_t wire_length = (std::endian::native == std::endian::little) ? std::byteswap(length) : length;
-
-            std::vector<std::byte> packet(6 + raw.size());
-            std::memcpy(packet.data(), &wire_length, 4);
-            packet[4] = static_cast<std::byte>(ch);
-            packet[5] = static_cast<std::byte>(Flags::None);
-            std::memcpy(packet.data() + 6, raw.data(), raw.size());
-
-            return packet;
-        }
-
-        static Result<Json> decode(std::span<const std::byte> buffer, Encoding enc = Encoding::MsgPack) {
-            try {
-                if (enc == Encoding::MsgPack) {
-                    return Json::from_msgpack(buffer);
-                }
-                const std::string s(reinterpret_cast<const char*>(buffer.data()), buffer.size());
-                return Json::parse(s);
-            } catch (const nlohmann::json::exception&) {
-                return std::unexpected(Error::ProtocolViolation);
-            }
-        }
-
-        static bool validate_schema(const Json& j, std::initializer_list<std::string_view> required_keys) {
-            for (auto key : required_keys) {
-                if (!j.contains(key)) return false;
-            }
-            return true;
-        }
+class Protocol {
+public:
+    enum Flags : std::uint8_t {
+        None = 0x00,
+        Fragment = 0x01,
+        LastFragment = 0x02,
+        Correlated = 0x04
     };
+
+    static std::uint32_t read_u32(std::span<const std::byte, 4> bytes) {
+        std::uint32_t value{};
+        std::memcpy(&value, bytes.data(), sizeof(value));
+        if constexpr (std::endian::native == std::endian::little) {
+            value = std::byteswap(value);
+        }
+        return value;
+    }
+
+    static void append_u32(std::vector<std::byte>& output, std::uint32_t value) {
+        if constexpr (std::endian::native == std::endian::little) {
+            value = std::byteswap(value);
+        }
+        const auto* first = reinterpret_cast<const std::byte*>(&value);
+        output.insert(output.end(), first, first + sizeof(value));
+    }
+
+    static Result<std::vector<std::byte>> encode_payload(const Json& payload, Encoding encoding) {
+        try {
+            std::vector<std::uint8_t> raw;
+            if (encoding == Encoding::MsgPack) {
+                raw = Json::to_msgpack(payload);
+            } else if (encoding == Encoding::JSON) {
+                const auto text = payload.dump();
+                raw.assign(text.begin(), text.end());
+            } else {
+                return unexpected(error(
+                    ErrorCategory::Serialization,
+                    StatusCode::ERR_ENCODING_UNSUPPORTED,
+                    ErrorPhase::ApplicationSend,
+                    "selected encoding is not supported"
+                ));
+            }
+            std::vector<std::byte> bytes(raw.size());
+            if (!raw.empty()) {
+                std::memcpy(bytes.data(), raw.data(), raw.size());
+            }
+            return bytes;
+        } catch (const nlohmann::json::exception& exception) {
+            return unexpected(error(
+                ErrorCategory::Serialization,
+                StatusCode::ERR_PROTOCOL_VIOLATION,
+                ErrorPhase::ApplicationSend,
+                exception.what()
+            ));
+        }
+    }
+
+    static Result<Json> decode_payload(std::span<const std::byte> payload, Encoding encoding) {
+        try {
+            if (encoding == Encoding::MsgPack) {
+                return Json::from_msgpack(payload.begin(), payload.end(), true, true);
+            }
+            if (encoding == Encoding::JSON) {
+                return Json::parse(
+                    reinterpret_cast<const char*>(payload.data()),
+                    reinterpret_cast<const char*>(payload.data() + payload.size())
+                );
+            }
+            return unexpected(error(
+                ErrorCategory::Protocol,
+                StatusCode::ERR_ENCODING_UNSUPPORTED,
+                ErrorPhase::FrameDecode,
+                "selected encoding is not supported"
+            ));
+        } catch (const nlohmann::json::exception& exception) {
+            return unexpected(error(
+                ErrorCategory::Protocol,
+                StatusCode::ERR_PROTOCOL_VIOLATION,
+                ErrorPhase::FrameDecode,
+                exception.what()
+            ));
+        }
+    }
+
+    static Result<Json> decode_control(std::span<const std::byte> payload) {
+        return decode_payload(payload, Encoding::JSON);
+    }
+
+    static Result<std::vector<std::byte>> frame(
+        Channel channel,
+        std::uint8_t flags,
+        std::span<const std::byte> payload
+    ) {
+        if (payload.size() > MAX_MESSAGE_SIZE) {
+            return unexpected(error(
+                ErrorCategory::Serialization,
+                StatusCode::ERR_PAYLOAD_TOO_LARGE,
+                ErrorPhase::ApplicationSend,
+                "frame payload exceeds 16 MiB"
+            ));
+        }
+        std::vector<std::byte> packet;
+        packet.reserve(6 + payload.size());
+        append_u32(packet, static_cast<std::uint32_t>(payload.size()));
+        packet.push_back(static_cast<std::byte>(channel));
+        packet.push_back(static_cast<std::byte>(flags));
+        packet.insert(packet.end(), payload.begin(), payload.end());
+        return packet;
+    }
+
+    static Result<std::vector<std::byte>> control_frame(const Json& payload) {
+        auto encoded = encode_payload(payload, Encoding::JSON);
+        if (!encoded) {
+            return unexpected(encoded.error());
+        }
+        return frame(Channel::Control, Flags::None, *encoded);
+    }
+
+    static ErrorInfo error(
+        ErrorCategory category,
+        StatusCode status,
+        ErrorPhase phase,
+        std::string cause,
+        std::optional<SessionHandle> session = std::nullopt
+    ) {
+        return ErrorInfo{category, status, phase, std::move(cause), std::move(session)};
+    }
+};
+
 }
 
 /*
- * protocol.hpp: C++ frame codec utilities for Yuumi.
- * - Encodes JSON objects into framed byte payloads with fixed 6-byte headers.
- * - Decodes payload buffers from JSON or MsgPack into typed Json objects.
- * - Provides lightweight schema-key presence validation for inbound/outbound contracts.
+ * Protocol performs strict codec selection and never substitutes raw strings
+ * for malformed JSON or MessagePack. Frame sizes are checked before allocation,
+ * and Control payloads always use JSON independently of application encoding.
  */

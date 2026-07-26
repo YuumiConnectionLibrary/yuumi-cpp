@@ -11,15 +11,14 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(yuumi
-    VERSION 0.1.0
-    DESCRIPTION "Yuumi C++ server SDK"
+    VERSION 0.2.0
+    DESCRIPTION "Yuumi C++ engine SDK"
     LANGUAGES CXX
 )
 
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
-find_package(asio CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
 # Header-only library target
@@ -39,14 +38,19 @@ target_include_directories(yuumi_cpp INTERFACE
 
 target_link_libraries(yuumi_cpp INTERFACE
     Threads::Threads
-    asio::asio
     nlohmann_json::nlohmann_json
 )
+
+if(WIN32)
+    target_link_libraries(yuumi_cpp INTERFACE advapi32)
+endif()
 
 option(YUUMI_BUILD_TESTS "Build Yuumi test applications" ON)
 option(YUUMI_BUILD_EXAMPLES "Build Yuumi example applications" ON)
 
-if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/path_check.cpp")
+if(YUUMI_BUILD_TESTS)
+    enable_testing()
+
     add_executable(yuumi_path_check tests/path_check.cpp)
     target_link_libraries(yuumi_path_check PRIVATE yuumi::cpp)
 
@@ -56,7 +60,49 @@ if(YUUMI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/path_check.cp
         target_compile_options(yuumi_path_check PRIVATE -Wall -Wextra -pedantic)
     endif()
 
-    message(STATUS "Yuumi path-check tool enabled.")
+    add_test(
+        NAME yuumi_path_check
+        COMMAND yuumi_path_check bridge 0123456789abcdef0123456789abcdef
+    )
+
+    set(
+        YUUMI_SPEC_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../yuumi-spec"
+        CACHE PATH
+        "Path to the canonical yuumi-spec checkout"
+    )
+    if(NOT EXISTS "${YUUMI_SPEC_DIR}/test-vectors/handshake_valid.bin")
+        message(FATAL_ERROR "YUUMI_SPEC_DIR must point to a yuumi-spec checkout containing test-vectors")
+    endif()
+
+    add_executable(yuumi_engine_conformance tests/engine_conformance.cpp)
+    target_link_libraries(yuumi_engine_conformance PRIVATE yuumi::cpp)
+    target_compile_definitions(
+        yuumi_engine_conformance
+        PRIVATE
+            YUUMI_ENABLE_TESTKIT=1
+            YUUMI_SPEC_VECTOR_DIR="${YUUMI_SPEC_DIR}/test-vectors"
+    )
+    if(MSVC)
+        target_compile_options(yuumi_engine_conformance PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(yuumi_engine_conformance PRIVATE -Wall -Wextra -pedantic)
+    endif()
+
+    foreach(case_number RANGE 1 64)
+        if(case_number LESS 10)
+            set(case_id "00${case_number}")
+        else()
+            set(case_id "0${case_number}")
+        endif()
+        add_test(
+            NAME "yuumi_EC-${case_id}"
+            COMMAND yuumi_engine_conformance "${case_number}"
+        )
+        set_tests_properties("yuumi_EC-${case_id}" PROPERTIES TIMEOUT 15)
+    endforeach()
+
+    message(STATUS "Yuumi Engine Conformance EC-001 through EC-064 enabled.")
 endif()
 
 if(YUUMI_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp_server/main.cpp")
