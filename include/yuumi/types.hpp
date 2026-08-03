@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -54,22 +56,28 @@ enum class StatusCode : std::uint32_t {
     ERR_INTERNAL = 599
 };
 
-enum class ErrorCategory {
+enum class ErrorKind {
     Configuration,
-    Endpoint,
+    AddressDerivation,
+    Dial,
+    Timeout,
     Handshake,
     Protocol,
+    Encoding,
+    Capability,
+    Backpressure,
+    SessionClosed,
+    StaleEpoch,
+    Application,
     Transport,
-    Serialization,
-    Session,
-    Internal
+    Internal,
+    State
 };
 
 enum class ErrorPhase {
     Configuration,
-    EndpointProbe,
-    EndpointOpen,
-    Accept,
+    AddressDerivation,
+    Dial,
     HandshakeRead,
     HandshakeValidate,
     AckWrite,
@@ -79,37 +87,42 @@ enum class ErrorPhase {
     FrameWrite,
     Heartbeat,
     Fragmentation,
+    ApplicationDispatch,
     ApplicationSend,
     Close
 };
 
 enum class DisconnectReason {
-    EngineClose,
+    LocalClose,
     PeerClose,
     HeartbeatTimeout,
     ProtocolFailure,
-    TransportFailure
+    TransportFailure,
+    Backpressure
 };
 
-struct SessionHandle {
-    std::string session_id;
-    std::uint64_t epoch{};
-
-    friend bool operator==(const SessionHandle&, const SessionHandle&) = default;
+enum class EngineState {
+    Idle,
+    Connecting,
+    Connected,
+    Closing
 };
 
 struct SessionView {
-    SessionHandle handle;
+    std::string session_id;
+    std::uint64_t epoch{};
     Encoding encoding{Encoding::MsgPack};
     std::uint32_t capabilities{};
+
+    friend bool operator==(const SessionView&, const SessionView&) = default;
 };
 
 struct ErrorInfo {
-    ErrorCategory category{ErrorCategory::Internal};
-    StatusCode status{StatusCode::ERR_INTERNAL};
-    ErrorPhase phase{ErrorPhase::Configuration};
+    ErrorKind kind{ErrorKind::Internal};
     std::string cause;
-    std::optional<SessionHandle> session;
+    std::optional<StatusCode> status;
+    std::optional<ErrorPhase> phase;
+    std::optional<std::uint64_t> epoch;
 };
 
 template <typename E>
@@ -202,16 +215,81 @@ private:
 template <typename T = void>
 using Result = Expected<T, ErrorInfo>;
 
+namespace detail {
+class EngineImpl;
+}
+
+class Responder {
+public:
+    Result<> respond(const Json& payload) const {
+        std::function<Result<>(const Json&)> send;
+        {
+            std::lock_guard lock(state_->mutex);
+            if (state_->used) {
+                return unexpected(ErrorInfo{
+                    ErrorKind::StaleEpoch,
+                    "responder is single-use or stale",
+                    StatusCode::ERR_PROTOCOL_VIOLATION,
+                    ErrorPhase::ApplicationSend,
+                    state_->epoch
+                });
+            }
+            state_->used = true;
+            send = state_->send;
+        }
+        return send(payload);
+    }
+
+    std::uint64_t epoch() const noexcept {
+        return state_->epoch;
+    }
+
+    std::uint32_t correlation_id() const noexcept {
+        return state_->correlation_id;
+    }
+
+private:
+    struct State {
+        std::mutex mutex;
+        bool used{};
+        std::uint64_t epoch{};
+        std::uint32_t correlation_id{};
+        std::function<Result<>(const Json&)> send;
+    };
+
+    explicit Responder(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+    void invalidate() const {
+        std::lock_guard lock(state_->mutex);
+        state_->used = true;
+    }
+
+    std::shared_ptr<State> state_;
+
+    friend class detail::EngineImpl;
+};
+
 struct MessageEvent {
-    SessionHandle session;
+    SessionView session;
     Channel channel{Channel::Data};
     Json payload;
     std::optional<std::uint32_t> correlation_id;
+    std::shared_ptr<Responder> responder;
+};
+
+struct HeartbeatEvent {
+    SessionView session;
+    std::int64_t timestamp{};
+};
+
+struct TerminalResult {
+    DisconnectReason reason{DisconnectReason::PeerClose};
+    std::optional<ErrorInfo> error;
 };
 
 struct DisconnectEvent {
-    SessionHandle session;
-    DisconnectReason reason{DisconnectReason::TransportFailure};
+    SessionView session;
+    TerminalResult terminal;
 };
 
 struct HeartbeatSettings {
@@ -228,16 +306,18 @@ struct FragmentationSettings {
 struct EngineConfig {
     std::string endpoint_name;
     std::string token;
-    std::int64_t max_sessions{1};
     std::vector<Encoding> supported_encodings{Encoding::MsgPack, Encoding::JSON};
     std::uint32_t supported_capabilities{CAP_CORRELATION};
-    std::optional<std::uint32_t> expected_pid;
+    std::optional<std::uint32_t> expected_go_pid;
+    std::chrono::milliseconds connect_timeout{std::chrono::seconds(10)};
+    std::size_t application_queue_capacity{64};
     HeartbeatSettings heartbeat;
     FragmentationSettings fragmentation;
 };
 
 using SessionConnectedHandler = std::function<void(const SessionView&)>;
 using MessageHandler = std::function<void(const MessageEvent&)>;
+using HeartbeatHandler = std::function<void(const HeartbeatEvent&)>;
 using ErrorHandler = std::function<void(const ErrorInfo&)>;
 using SessionDisconnectedHandler = std::function<void(const DisconnectEvent&)>;
 
@@ -270,6 +350,6 @@ constexpr std::string_view to_string(StatusCode code) {
  * Public Engine API values are deliberately transport-neutral.
  * Configuration has protocol-conforming defaults and uses Disabled rather than
  * Enabled so its zero-value boolean keeps heartbeat emission active.
- * SessionHandle contains both the wire-visible identifier and local epoch, so
- * stale handles cannot address a replacement session.
+ * SessionView exposes the wire-visible identifier and local epoch while
+ * responder authority remains single-use and bound to that epoch.
  */

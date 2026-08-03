@@ -6,18 +6,20 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-#ifdef _WIN32
-#include <aclapi.h>
-#else
+#ifndef _WIN32
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -55,14 +57,14 @@ inline std::string hex8(std::uint32_t value) {
     return result;
 }
 
-inline EngineConfig config(std::int64_t max_sessions = 1) {
+inline EngineConfig config() {
     static std::atomic<std::uint32_t> sequence{1};
     const auto value = sequence.fetch_add(1, std::memory_order_relaxed);
     EngineConfig result;
     result.endpoint_name = "ct-" + hex8(process_id()) + "-" + hex8(value);
     result.token = std::string(24, '0') + hex8(value);
-    result.max_sessions = max_sessions;
     result.heartbeat.disabled = true;
+    result.connect_timeout = std::chrono::seconds(2);
     return result;
 }
 
@@ -85,6 +87,14 @@ inline void set_u32(std::span<std::byte> bytes, std::size_t offset, std::uint32_
     std::copy(encoded.begin(), encoded.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
 }
 
+inline std::vector<std::byte> handshake(std::string_view name = "handshake_valid") {
+    auto bytes = fixture(name);
+    if (bytes.size() >= 12) {
+        set_u32(bytes, 8, process_id());
+    }
+    return bytes;
+}
+
 struct Frame {
     Channel channel{Channel::Control};
     std::uint8_t flags{};
@@ -93,21 +103,8 @@ struct Frame {
 
 class Peer {
 public:
+    Peer() = default;
     explicit Peer(std::shared_ptr<detail::Stream> value) : stream_(std::move(value)) {}
-
-    static Peer connect(const std::string& address) {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        std::string last_error;
-        do {
-            auto connected = detail::connect(address);
-            if (connected) {
-                return Peer(*connected);
-            }
-            last_error = connected.error();
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        } while (std::chrono::steady_clock::now() < deadline);
-        throw Failure("cannot connect private test peer: " + last_error);
-    }
 
     detail::IoResult write(std::span<const std::byte> bytes) {
         return stream_->write_exact(bytes);
@@ -121,7 +118,7 @@ public:
         std::array<std::byte, 6> header{};
         require(read(header).state == detail::IoState::Complete, "expected a complete frame header");
         const auto length = Protocol::read_u32(std::span<const std::byte, 4>(header.data(), 4));
-        require(length <= MAX_MESSAGE_SIZE, "test peer received an oversized frame");
+        require(length <= MAX_MESSAGE_SIZE, "test listener received an oversized frame");
         Frame result;
         result.channel = static_cast<Channel>(std::to_integer<std::uint8_t>(header[4]));
         result.flags = std::to_integer<std::uint8_t>(header[5]);
@@ -130,41 +127,190 @@ public:
         return result;
     }
 
-    std::array<std::byte, 4> handshake(
-        std::vector<std::byte> bytes,
-        bool preserve_vector_pid = true
-    ) {
-        if (!preserve_vector_pid) {
-            set_u32(bytes, 8, process_id());
-        }
-        require(write(bytes).state == detail::IoState::Complete, "cannot write handshake");
-        std::array<std::byte, 4> acknowledgement{};
-        require(read(acknowledgement).state == detail::IoState::Complete, "expected handshake ACK");
-        const auto assignment = read_frame();
-        require(assignment.channel == Channel::Control && assignment.flags == 0, "session assignment ordering is invalid");
-        auto control = Protocol::decode_control(assignment.payload);
-        require(control && control->value("type", std::string()) == "session", "missing session assignment");
-        require(!control->value("session_id", std::string()).empty(), "session identifier is empty");
-        return acknowledgement;
+    void write_frame(Channel channel, std::uint8_t flags, std::span<const std::byte> payload) {
+        auto packet = Protocol::frame(channel, flags, payload);
+        require(packet.has_value(), "could not build test frame");
+        require(write(*packet).state == detail::IoState::Complete, "could not write test frame");
     }
 
-    std::shared_ptr<detail::Stream> stream() const {
-        return stream_;
+    void write_control(const Json& value) {
+        auto packet = Protocol::control_frame(value);
+        require(packet.has_value(), "could not build test Control frame");
+        require(write(*packet).state == detail::IoState::Complete, "could not write test Control frame");
     }
 
     void close() {
-        stream_->close();
+        if (stream_) {
+            stream_->close();
+        }
     }
 
 private:
     std::shared_ptr<detail::Stream> stream_;
 };
 
+class GoListener {
+public:
+    explicit GoListener(const EngineConfig& value) {
+        auto derived = detail::resolve_transport_address(value.endpoint_name, value.token);
+        require(derived.has_value(), "test listener address derivation failed");
+        address_ = *derived;
+        open();
+    }
+
+    GoListener(const GoListener&) = delete;
+    GoListener& operator=(const GoListener&) = delete;
+
+    ~GoListener() {
+        close();
+    }
+
+    Peer accept() {
+#ifdef _WIN32
+        const auto handle = pending_.load(std::memory_order_acquire);
+        require(handle != INVALID_HANDLE_VALUE, "test Named Pipe is not open");
+        OVERLAPPED operation{};
+        operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        require(operation.hEvent != nullptr, "could not create test accept event");
+        const auto connected = ConnectNamedPipe(handle, &operation) != FALSE;
+        auto code = connected ? ERROR_SUCCESS : GetLastError();
+        if (!connected && code == ERROR_IO_PENDING) {
+            WaitForSingleObject(operation.hEvent, INFINITE);
+            DWORD transferred{};
+            code = GetOverlappedResult(handle, &operation, &transferred, FALSE)
+                ? ERROR_SUCCESS : GetLastError();
+        } else if (!connected && code == ERROR_PIPE_CONNECTED) {
+            code = ERROR_SUCCESS;
+        }
+        CloseHandle(operation.hEvent);
+        require(code == ERROR_SUCCESS, "test Named Pipe accept failed: " + std::to_string(code));
+        pending_.store(INVALID_HANDLE_VALUE, std::memory_order_release);
+        return Peer(std::make_shared<detail::Stream>(handle));
+#else
+        const auto connection = ::accept(descriptor_.load(std::memory_order_acquire), nullptr, nullptr);
+        require(connection >= 0, "test Unix listener accept failed");
+        return Peer(std::make_shared<detail::Stream>(connection));
+#endif
+    }
+
+    const std::string& address() const noexcept {
+        return address_;
+    }
+
+    void close() {
+        if (closed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+#ifdef _WIN32
+        const auto handle = pending_.exchange(INVALID_HANDLE_VALUE, std::memory_order_acq_rel);
+        if (handle != INVALID_HANDLE_VALUE) {
+            CancelIoEx(handle, nullptr);
+            CloseHandle(handle);
+        }
+#else
+        const auto descriptor = descriptor_.exchange(-1, std::memory_order_acq_rel);
+        if (descriptor >= 0) {
+            shutdown(descriptor, SHUT_RDWR);
+            ::close(descriptor);
+        }
+        if (!address_.empty()) {
+            unlink(address_.c_str());
+        }
+#endif
+    }
+
+private:
+    void open() {
+#ifdef _WIN32
+        const std::wstring address(address_.begin(), address_.end());
+        const auto handle = CreateNamedPipeW(
+            address.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            64U * 1024U,
+            64U * 1024U,
+            0,
+            nullptr
+        );
+        require(handle != INVALID_HANDLE_VALUE, "could not create test Named Pipe");
+        pending_.store(handle, std::memory_order_release);
+#else
+        sockaddr_un endpoint{};
+        endpoint.sun_family = AF_UNIX;
+        std::memcpy(endpoint.sun_path, address_.c_str(), address_.size() + 1);
+        unlink(address_.c_str());
+        const auto descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+        require(descriptor >= 0, "could not create test Unix listener");
+        require(bind(descriptor, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) == 0,
+                "could not bind test Unix listener");
+        require(chmod(address_.c_str(), S_IRUSR | S_IWUSR) == 0,
+                "could not protect test Unix listener");
+        require(listen(descriptor, 1) == 0, "could not listen on test Unix socket");
+        descriptor_.store(descriptor, std::memory_order_release);
+#endif
+        closed_.store(false, std::memory_order_release);
+    }
+
+    std::string address_;
+    std::atomic_bool closed_{true};
+#ifdef _WIN32
+    std::atomic<HANDLE> pending_{INVALID_HANDLE_VALUE};
+#else
+    std::atomic<int> descriptor_{-1};
+#endif
+};
+
+struct ConnectedPeer {
+    Peer peer;
+    std::array<std::byte, 4> acknowledgement{};
+    Frame assignment;
+};
+
+inline std::pair<SessionView, ConnectedPeer> establish(
+    Engine& engine,
+    GoListener& listener,
+    std::vector<std::byte> handshake_bytes = handshake()
+) {
+    std::promise<ConnectedPeer> promised;
+    auto ready = promised.get_future();
+    std::thread peer_thread([&listener, bytes = std::move(handshake_bytes), promised = std::move(promised)]() mutable {
+        try {
+            auto peer = listener.accept();
+            require(peer.write(bytes).state == detail::IoState::Complete, "could not send handshake");
+            ConnectedPeer result;
+            result.peer = std::move(peer);
+            require(result.peer.read(result.acknowledgement).state == detail::IoState::Complete,
+                    "expected handshake acknowledgement");
+            result.assignment = result.peer.read_frame();
+            promised.set_value(std::move(result));
+        } catch (...) {
+            promised.set_exception(std::current_exception());
+        }
+    });
+    const auto connected = engine.connect();
+    if (!connected) {
+        peer_thread.join();
+        throw Failure("engine connect failed: " + connected.error().cause);
+    }
+    auto peer = ready.get();
+    peer_thread.join();
+    require(peer.assignment.channel == Channel::Control && peer.assignment.flags == 0,
+            "session assignment ordering is invalid");
+    auto assignment = Protocol::decode_control(peer.assignment.payload);
+    require(assignment && assignment->value("type", std::string()) == "session",
+            "missing session assignment");
+    require(assignment->value("session_id", std::string()) == connected->session_id,
+            "session assignment does not match API view");
+    return {*connected, std::move(peer)};
+}
+
 struct Events {
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<SessionView> connected;
     std::vector<MessageEvent> messages;
+    std::vector<HeartbeatEvent> heartbeats;
     std::vector<ErrorInfo> errors;
     std::vector<DisconnectEvent> disconnected;
 
@@ -177,6 +323,11 @@ struct Events {
         engine.on_message([this](const MessageEvent& event) {
             std::lock_guard lock(mutex);
             messages.push_back(event);
+            changed.notify_all();
+        });
+        engine.on_heartbeat([this](const HeartbeatEvent& event) {
+            std::lock_guard lock(mutex);
+            heartbeats.push_back(event);
             changed.notify_all();
         });
         engine.on_error([this](const ErrorInfo& event) {
@@ -194,63 +345,25 @@ struct Events {
     template <typename Predicate>
     void wait(Predicate predicate, std::string message) {
         std::unique_lock lock(mutex);
-        require(changed.wait_for(lock, std::chrono::seconds(2), predicate), std::move(message));
+        require(changed.wait_for(lock, std::chrono::seconds(3), predicate), std::move(message));
     }
 };
 
-struct OpenEngine {
-    explicit OpenEngine(
-        EngineConfig value,
-        std::shared_ptr<detail::EngineTestHooks> hooks = {}
-    ) : config(std::move(value)), engine(config) {
-        if (hooks) {
-            engine.install_test_hooks(std::move(hooks));
+template <typename Predicate>
+inline void wait_until(Predicate predicate, std::string message) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw Failure(std::move(message));
         }
-        events.attach(engine);
-        auto result = engine.open();
-        require(result.has_value(), "engine open failed: " + (result ? std::string() : result.error().cause));
-        auto derived = resolve_transport_address(config.endpoint_name, config.token);
-        require(derived.has_value(), "address derivation failed after valid open");
-        address = *derived;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-
-    ~OpenEngine() {
-        static_cast<void>(engine.close());
-    }
-
-    EngineConfig config;
-    Engine engine;
-    Events events;
-    std::string address;
-};
-
-inline SessionView wait_connected(OpenEngine& opened, std::size_t count = 1) {
-    opened.events.wait(
-        [&] { return opened.events.connected.size() >= count; },
-        "connected event deadline expired"
-    );
-    return opened.events.connected[count - 1];
-}
-
-inline Peer establish(
-    OpenEngine& opened,
-    std::string_view handshake_name = "handshake_valid",
-    bool preserve_vector_pid = true
-) {
-    std::size_t expected_count{};
-    {
-        std::lock_guard lock(opened.events.mutex);
-        expected_count = opened.events.connected.size() + 1;
-    }
-    auto peer = Peer::connect(opened.address);
-    static_cast<void>(peer.handshake(fixture(handshake_name), preserve_vector_pid));
-    static_cast<void>(wait_connected(opened, expected_count));
-    return peer;
 }
 
 }
 
 /*
- * The private peer is test infrastructure only. It consumes canonical vectors
- * from yuumi-spec at runtime and never installs or exposes a client API.
+ * This private testkit deliberately implements the Go-role listener so the
+ * public C++ package remains dialer-only. It owns endpoint creation and cleanup
+ * solely for conformance tests and consumes canonical vectors at runtime.
  */

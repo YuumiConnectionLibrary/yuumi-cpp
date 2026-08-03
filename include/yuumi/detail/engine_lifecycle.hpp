@@ -4,15 +4,16 @@
 
 namespace yuumi::detail {
 
-inline Result<> EngineImpl::validate_config() const {
+inline EngineImpl::~EngineImpl() {
+    join_workers();
+}
+
+inline Result<> EngineImpl::validate_config(const EngineConfig& config) const {
     if (!valid_endpoint_name(config.endpoint_name)) {
         return unexpected(configuration_error("invalid endpoint_name"));
     }
     if (!valid_token(config.token)) {
         return unexpected(configuration_error("invalid token"));
-    }
-    if (config.max_sessions <= 0) {
-        return unexpected(configuration_error("max_sessions must be greater than zero"));
     }
     if (config.supported_encodings.empty()) {
         return unexpected(configuration_error("supported_encodings must not be empty"));
@@ -29,7 +30,18 @@ inline Result<> EngineImpl::validate_config() const {
         encodings |= bit;
     }
     if ((config.supported_capabilities & ~IMPLEMENTED_CAPABILITIES) != 0) {
-        return unexpected(configuration_error("supported_capabilities enables an unimplemented bit"));
+        return unexpected(Protocol::error(
+            ErrorKind::Capability,
+            "supported_capabilities enables an unimplemented bit",
+            StatusCode::ERR_PROTOCOL_VIOLATION,
+            ErrorPhase::Configuration
+        ));
+    }
+    if (config.connect_timeout.count() <= 0) {
+        return unexpected(configuration_error("connect_timeout must be positive"));
+    }
+    if (config.application_queue_capacity == 0) {
+        return unexpected(configuration_error("application_queue_capacity must be positive"));
     }
     if (!config.heartbeat.disabled &&
         (config.heartbeat.interval.count() <= 0 || config.heartbeat.missed_interval_limit == 0)) {
@@ -42,209 +54,241 @@ inline Result<> EngineImpl::validate_config() const {
     return {};
 }
 
-inline Result<> EngineImpl::open() {
-    std::unique_lock lifecycle_lock(lifecycle_mutex);
-    if (lifecycle != Lifecycle::Closed) {
-        return unexpected(Protocol::error(
-            ErrorCategory::Endpoint,
-            StatusCode::ERR_PIPE_FAILED,
-            ErrorPhase::EndpointOpen,
-            "engine is already open or changing state"
-        ));
+inline EngineState EngineImpl::state() const {
+    std::lock_guard lock(lifecycle_mutex);
+    return lifecycle;
+}
+
+inline std::optional<SessionView> EngineImpl::session() const {
+    std::lock_guard lock(lifecycle_mutex);
+    if (lifecycle != EngineState::Connected || !current) {
+        return std::nullopt;
     }
-    lifecycle = Lifecycle::Opening;
-    lifecycle_lock.unlock();
-    if (auto valid = validate_config(); !valid) {
-        lifecycle_lock.lock();
-        lifecycle = Lifecycle::Closed;
+    return current->view;
+}
+
+inline void EngineImpl::join_workers() {
+    const auto own = std::this_thread::get_id();
+    const auto settle = [own](std::thread& worker) {
+        if (!worker.joinable()) {
+            return;
+        }
+        if (worker.get_id() == own) {
+            worker.detach();
+        } else {
+            worker.join();
+        }
+    };
+    settle(reader_thread);
+    settle(maintenance_thread);
+    settle(dispatcher_thread);
+}
+
+inline Result<SessionView> EngineImpl::connect() {
+    EngineConfig config;
+    {
+        std::lock_guard lock(lifecycle_mutex);
+        if (lifecycle != EngineState::Idle) {
+            return unexpected(Protocol::error(
+                ErrorKind::State,
+                lifecycle == EngineState::Connecting
+                    ? "engine is already connecting"
+                    : "engine is already connected or closing",
+                StatusCode::ERR_PROTOCOL_VIOLATION,
+                ErrorPhase::Dial
+            ));
+        }
+        lifecycle = EngineState::Connecting;
+        cancel_connect.store(false, std::memory_order_release);
+        config = source_config;
+    }
+    join_workers();
+
+    const auto fail = [this](ErrorInfo failure) -> Result<SessionView> {
+        {
+            std::lock_guard lock(lifecycle_mutex);
+            candidate_stream.reset();
+            lifecycle = EngineState::Idle;
+        }
         lifecycle_cv.notify_all();
-        return valid;
+        emit_pre_session_error(failure);
+        return unexpected(std::move(failure));
+    };
+
+    if (auto valid = validate_config(config); !valid) {
+        return fail(valid.error());
     }
     auto address = resolve_transport_address(config.endpoint_name, config.token);
     if (!address) {
-        lifecycle_lock.lock();
-        lifecycle = Lifecycle::Closed;
-        lifecycle_cv.notify_all();
-        return unexpected(address.error());
+        return fail(address.error());
     }
-    auto new_listener = std::make_shared<Listener>();
-    if (auto opened = new_listener->open(*address); !opened) {
-        lifecycle_lock.lock();
-        lifecycle = Lifecycle::Closed;
-        lifecycle_cv.notify_all();
-        return opened;
+    const auto deadline = std::chrono::steady_clock::now() + config.connect_timeout;
+    if (test_hooks) {
+        test_hooks->dial_attempts.fetch_add(1, std::memory_order_relaxed);
+        if (test_hooks->fail_dial.exchange(false, std::memory_order_acq_rel)) {
+            return fail(Protocol::error(
+                ErrorKind::Dial,
+                "injected dial failure",
+                StatusCode::ERR_PIPE_FAILED,
+                ErrorPhase::Dial
+            ));
+        }
     }
-    listener = std::move(new_listener);
-    accepting.store(true, std::memory_order_release);
-    auto self = shared_from_this();
-    accept_thread = std::thread([self] { self->accept_loop(); });
-    maintenance_thread = std::thread([self] { self->maintenance_loop(); });
-    lifecycle_lock.lock();
-    lifecycle = Lifecycle::Open;
+    auto connected = dial(*address, deadline, cancel_connect);
+    if (!connected) {
+        return fail(connected.error());
+    }
+    bool closed_during_dial{};
+    {
+        std::lock_guard lock(lifecycle_mutex);
+        if (lifecycle != EngineState::Connecting || cancel_connect.load(std::memory_order_acquire)) {
+            closed_during_dial = true;
+        } else {
+            candidate_stream = *connected;
+        }
+    }
+    if (closed_during_dial) {
+        (*connected)->close();
+        return fail(Protocol::error(
+            ErrorKind::SessionClosed,
+            "connection attempt was closed locally",
+            StatusCode::ERR_CONNECTION_LOST,
+            ErrorPhase::Close
+        ));
+    }
+
+    auto established = establish(*connected, config, deadline);
+    if (!established) {
+        (*connected)->close();
+        if (cancel_connect.load(std::memory_order_acquire)) {
+            return fail(Protocol::error(
+                ErrorKind::SessionClosed,
+                "connection attempt was closed locally",
+                StatusCode::ERR_CONNECTION_LOST,
+                ErrorPhase::Close
+            ));
+        }
+        return fail(established.error());
+    }
+
+    auto active = std::make_shared<EngineSession>(*connected, *established, config);
+    const auto now = ticks(std::chrono::steady_clock::now());
+    active->last_activity.store(now, std::memory_order_release);
+    active->last_heartbeat.store(now, std::memory_order_release);
+    bool closed_during_establishment{};
+    {
+        std::lock_guard lock(lifecycle_mutex);
+        if (lifecycle != EngineState::Connecting || cancel_connect.load(std::memory_order_acquire)) {
+            closed_during_establishment = true;
+        } else {
+            current = active;
+            candidate_stream.reset();
+            next_epoch.store(active->view.epoch, std::memory_order_release);
+            lifecycle = EngineState::Connected;
+        }
+    }
+    if (closed_during_establishment) {
+        active->stream->close();
+        return fail(Protocol::error(
+            ErrorKind::SessionClosed,
+            "connection attempt was closed locally",
+            StatusCode::ERR_CONNECTION_LOST,
+            ErrorPhase::Close
+        ));
+    }
     lifecycle_cv.notify_all();
-    return {};
+
+    try {
+        auto self = shared_from_this();
+        dispatcher_thread = std::thread([self, active] { self->dispatcher_loop(active); });
+        enqueue_application(active, DispatchEvent{
+            DispatchEvent::Type::Connected,
+            active->view,
+            true
+        });
+        reader_thread = std::thread([self, active] { self->reader_loop(active); });
+        maintenance_thread = std::thread([self, active] { self->maintenance_loop(active); });
+    } catch (const std::system_error& exception) {
+        const auto failure = Protocol::error(
+            ErrorKind::Internal,
+            exception.what(),
+            StatusCode::ERR_INTERNAL,
+            ErrorPhase::Close,
+            active->view.epoch
+        );
+        set_terminal(active, DisconnectReason::TransportFailure, failure);
+        request_close(active, DisconnectReason::TransportFailure);
+        finalize_session(active);
+        join_workers();
+        return unexpected(failure);
+    }
+    return active->view;
 }
 
 inline Result<> EngineImpl::close() {
-    if (callback_owner == this) {
-        return unexpected(Protocol::error(
-            ErrorCategory::Internal,
-            StatusCode::ERR_INTERNAL,
-            ErrorPhase::Close,
-            "close cannot run synchronously from an Engine callback"
-        ));
-    }
-    std::unique_lock lifecycle_lock(lifecycle_mutex);
-    if (lifecycle == Lifecycle::Closed) {
-        return {};
-    }
-    if (lifecycle == Lifecycle::Closing) {
-        lifecycle_cv.wait(lifecycle_lock, [this] { return lifecycle == Lifecycle::Closed; });
-        return {};
-    }
-    if (lifecycle == Lifecycle::Opening) {
-        lifecycle_cv.wait(lifecycle_lock, [this] { return lifecycle != Lifecycle::Opening; });
-        if (lifecycle == Lifecycle::Closed) {
+    std::shared_ptr<EngineSession> active;
+    {
+        std::unique_lock lock(lifecycle_mutex);
+        if (lifecycle == EngineState::Idle) {
+            lock.unlock();
+            join_workers();
             return {};
         }
+        if (lifecycle == EngineState::Closing) {
+            if (dispatcher_thread.joinable() && dispatcher_thread.get_id() == std::this_thread::get_id()) {
+                return {};
+            }
+            lifecycle_cv.wait(lock, [this] { return lifecycle == EngineState::Idle; });
+            lock.unlock();
+            join_workers();
+            return {};
+        }
+        lifecycle = EngineState::Closing;
+        cancel_connect.store(true, std::memory_order_release);
+        if (candidate_stream) {
+            candidate_stream->close();
+        }
+        active = current;
     }
-    lifecycle = Lifecycle::Closing;
-    accepting.store(false, std::memory_order_release);
-    lifecycle_lock.unlock();
-    if (listener) {
-        listener->close();
+    if (active) {
+        set_terminal(active, DisconnectReason::LocalClose);
+        request_close(active, DisconnectReason::LocalClose);
     }
-    std::vector<std::shared_ptr<EngineSession>> active;
-    {
-        std::lock_guard sessions_lock(sessions_mutex);
-        active.assign(connections.begin(), connections.end());
-    }
-    for (const auto& session : active) {
-        request_close(session, DisconnectReason::EngineClose);
-    }
-    maintenance_cv.notify_all();
-    if (accept_thread.joinable()) {
-        accept_thread.join();
-    }
-    if (maintenance_thread.joinable()) {
-        maintenance_thread.join();
-    }
-    {
-        std::unique_lock worker_lock(worker_mutex);
-        worker_cv.wait(worker_lock, [this] { return active_workers == 0; });
+    if (dispatcher_thread.joinable() && dispatcher_thread.get_id() == std::this_thread::get_id()) {
+        return {};
     }
     {
-        std::lock_guard sessions_lock(sessions_mutex);
-        sessions.clear();
-        connections.clear();
+        std::unique_lock lock(lifecycle_mutex);
+        lifecycle_cv.wait(lock, [this] { return lifecycle == EngineState::Idle; });
     }
-    listener.reset();
-    lifecycle_lock.lock();
-    lifecycle = Lifecycle::Closed;
-    lifecycle_cv.notify_all();
+    join_workers();
     return {};
 }
 
-inline void EngineImpl::accept_loop() {
-    while (accepting.load(std::memory_order_acquire)) {
-        auto accepted = listener->accept();
-        if (!accepted) {
-            if (accepting.load(std::memory_order_acquire)) {
-                emit_error(Protocol::error(
-                    ErrorCategory::Endpoint,
-                    StatusCode::ERR_PIPE_FAILED,
-                    ErrorPhase::Accept,
-                    accepted.error()
-                ));
-            }
-            continue;
-        }
-        auto session = std::make_shared<EngineSession>(*accepted);
-        if (test_hooks && test_hooks->fail_accept.exchange(false, std::memory_order_acq_rel)) {
-            session->stream->close();
-            emit_error(Protocol::error(
-                ErrorCategory::Endpoint,
-                StatusCode::ERR_PIPE_FAILED,
-                ErrorPhase::Accept,
-                "injected accept failure"
-            ));
-            continue;
-        }
-        bool admitted{};
-        {
-            std::lock_guard sessions_lock(sessions_mutex);
-            admitted = connections.size() < static_cast<std::size_t>(config.max_sessions);
-            if (admitted) {
-                connections.insert(session);
-            }
-        }
-        if (!admitted) {
-            session->stream->close();
-            continue;
-        }
-        {
-            std::lock_guard worker_lock(worker_mutex);
-            ++active_workers;
-        }
-        auto self = shared_from_this();
-        std::thread([self, session] {
-            self->session_loop(session);
-            {
-                std::lock_guard worker_lock(self->worker_mutex);
-                --self->active_workers;
-            }
-            self->worker_cv.notify_all();
-        }).detach();
-    }
-}
-
-inline void EngineImpl::maintenance_loop() {
-    std::unique_lock maintenance_lock(maintenance_mutex);
-    while (accepting.load(std::memory_order_acquire)) {
-        maintenance_cv.wait_for(maintenance_lock, std::chrono::milliseconds(50));
-        if (!accepting.load(std::memory_order_acquire)) {
+inline void EngineImpl::maintenance_loop(const std::shared_ptr<EngineSession>& session) {
+    while (!session->close_requested.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        if (session->close_requested.load(std::memory_order_acquire)) {
             break;
         }
-        maintenance_lock.unlock();
-        maintain_sessions();
-        maintenance_lock.lock();
-    }
-}
-
-inline std::vector<std::shared_ptr<EngineSession>> EngineImpl::established_sessions() {
-    std::vector<std::shared_ptr<EngineSession>> result;
-    std::lock_guard sessions_lock(sessions_mutex);
-    result.reserve(sessions.size());
-    for (const auto& [identifier, session] : sessions) {
-        static_cast<void>(identifier);
-        result.push_back(session);
-    }
-    return result;
-}
-
-inline void EngineImpl::maintain_sessions() {
-    const auto now = std::chrono::steady_clock::now();
-    const auto now_ticks = ticks(now);
-    for (const auto& session : established_sessions()) {
-        if (session->close_requested.load(std::memory_order_acquire)) {
-            continue;
-        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto now_ticks = ticks(now);
         expire_fragments(session, now);
-        if (config.heartbeat.disabled) {
+        if (session->config.heartbeat.disabled) {
             continue;
         }
-        const auto interval = config.heartbeat.interval.count();
+        const auto interval = session->config.heartbeat.interval.count();
         const auto elapsed = now_ticks - session->last_activity.load(std::memory_order_acquire);
-        if (elapsed >= interval * static_cast<std::int64_t>(config.heartbeat.missed_interval_limit)) {
-            report_terminal(session, Protocol::error(
-                ErrorCategory::Transport,
+        if (elapsed >= interval * static_cast<std::int64_t>(session->config.heartbeat.missed_interval_limit)) {
+            set_terminal(session, DisconnectReason::HeartbeatTimeout, Protocol::error(
+                ErrorKind::Timeout,
+                "session heartbeat deadline expired",
                 StatusCode::ERR_READ_TIMEOUT,
                 ErrorPhase::Heartbeat,
-                "session heartbeat deadline expired",
-                session->handle
+                session->view.epoch
             ));
             request_close(session, DisconnectReason::HeartbeatTimeout);
-            continue;
+            break;
         }
         const auto since_heartbeat = now_ticks - session->last_heartbeat.load(std::memory_order_acquire);
         if (since_heartbeat >= interval) {
@@ -252,11 +296,11 @@ inline void EngineImpl::maintain_sessions() {
                 std::chrono::system_clock::now().time_since_epoch()
             ).count();
             if (auto sent = write_control(session, Json{{"type", "heartbeat"}, {"ts", utc}}); !sent) {
-                report_terminal(session, sent.error());
+                set_terminal(session, DisconnectReason::TransportFailure, sent.error());
                 request_close(session, DisconnectReason::TransportFailure);
-            } else {
-                session->last_heartbeat.store(now_ticks, std::memory_order_release);
+                break;
             }
+            session->last_heartbeat.store(now_ticks, std::memory_order_release);
         }
     }
 }
@@ -267,7 +311,7 @@ inline void EngineImpl::expire_fragments(
 ) {
     std::size_t expired{};
     {
-        std::lock_guard fragment_lock(session->fragment_mutex);
+        std::lock_guard lock(session->fragment_mutex);
         for (auto iterator = session->fragments.begin(); iterator != session->fragments.end();) {
             if (iterator->second.deadline <= now) {
                 iterator = session->fragments.erase(iterator);
@@ -278,20 +322,24 @@ inline void EngineImpl::expire_fragments(
         }
     }
     while (expired-- > 0) {
-        emit_session_error(session, Protocol::error(
-            ErrorCategory::Protocol,
-            StatusCode::ERR_FRAGMENT_TIMEOUT,
-            ErrorPhase::Fragmentation,
-            "incomplete fragment sequence expired",
-            session->handle
-        ));
+        enqueue_application(session, DispatchEvent{
+            DispatchEvent::Type::Error,
+            Protocol::error(
+                ErrorKind::Timeout,
+                "incomplete fragment sequence expired",
+                StatusCode::ERR_FRAGMENT_TIMEOUT,
+                ErrorPhase::Fragmentation,
+                session->view.epoch
+            ),
+            true
+        });
     }
 }
 
 }
 
 /*
- * Open validates before endpoint mutation, then starts independent accept and
- * maintenance workers. Close stops admission first and does not complete until
- * every admitted worker has released its slot and disconnect notification.
+ * connect performs exactly one bounded dial and establishment attempt. close
+ * cancels either the candidate or current stream, and reconnection can occur
+ * only after every epoch-owned worker has returned the engine to idle.
  */

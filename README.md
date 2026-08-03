@@ -4,7 +4,7 @@
 
 > C++23 engine SDK for the [Yuumi IPC protocol](https://github.com/YuumiConnectionLibrary/yuumi-spec).
 
-Yuumi connects a Go shell to a C++ logic engine through platform-native local IPC. The C++ SDK opens the endpoint, accepts isolated sessions, owns protocol Control traffic, and sends application output to one explicit session at a time. It does not expose a public client, process launcher, restart policy, or application semantics.
+Yuumi connects a Go shell to a C++ logic engine through platform-native local IPC. The Go client owns the endpoint and listens; the C++ engine performs one explicit dial and one handshake attempt. The SDK does not expose a public listener or client, create or clean endpoints, launch processes, retry connections, or impose an application payload schema.
 
 ## Requirements
 
@@ -13,17 +13,17 @@ Yuumi connects a Go shell to a C++ logic engine through platform-native local IP
 - vcpkg
 - A sibling `yuumi-spec` checkout, or `YUUMI_SPEC_DIR` pointing to one, when tests are enabled
 
-The only runtime codec dependency is `nlohmann-json`. Windows transport and security use Win32 directly.
+The only runtime codec dependency is `nlohmann-json`. Transport uses the platform API directly.
 
 ## Build and test
 
 ```bash
-cmake --preset linux-clang-debug
+cmake --preset linux-clang-debug -DYUUMI_SPEC_DIR=../yuumi-spec
 cmake --build --preset linux-clang-debug-build
 ctest --preset linux-clang-debug-test --output-on-failure
 ```
 
-Use `windows-msvc-debug` or `macos-clang-debug` and their matching build/test presets on the other supported platforms. The test configuration reads canonical `.bin` fixtures directly from `yuumi-spec/test-vectors`; it never copies them into this repository.
+Replace `debug` with `release` for optimized verification. Equivalent `windows-msvc-*` and `macos-clang-*` presets run the same EC-001 through EC-025 cases. Linux also provides `linux-clang-address` for AddressSanitizer plus UndefinedBehaviorSanitizer and `linux-clang-thread` for ThreadSanitizer.
 
 ## Engine configuration
 
@@ -33,99 +33,73 @@ Use `windows-msvc-debug` or `macos-clang-debug` and their matching build/test pr
 yuumi::EngineConfig config;
 config.endpoint_name = "pricing";
 config.token = "0123456789abcdef0123456789abcdef";
-config.max_sessions = 4;
 
 yuumi::Engine engine(std::move(config));
-
 engine.on_message([&engine](const yuumi::MessageEvent& message) {
     const yuumi::Json response{{"ok", true}};
-    if (message.correlation_id) {
-        engine.send_correlated(
-            message.session,
-            yuumi::Channel::Data,
-            *message.correlation_id,
-            response
-        );
-    } else {
-        engine.send(message.session, yuumi::Channel::Data, response);
+    const auto sent = message.responder
+        ? message.responder->respond(response)
+        : engine.send(yuumi::Channel::Data, response);
+    if (!sent) {
+        // Route sent.error() through the application's error policy.
     }
 });
 
-auto opened = engine.open();
-if (!opened) {
+auto connected = engine.connect();
+if (!connected) {
     return 1;
 }
 ```
 
-`open()` validates the complete configuration, secures the endpoint, starts accepting, and returns without waiting for a client. `close()` stops admission first, closes every session, waits for disconnect notifications, and is safe to call repeatedly.
+`connect()` validates a frozen configuration snapshot, derives the canonical address, performs one bounded dial, receives and validates the 16-byte Go handshake, writes ACK followed by session assignment, and returns only when the session is usable. It never retries. After a terminal disconnect returns the engine to `Idle`, reconnection requires another explicit `connect()`.
 
-Required configuration:
-
-| Field | Behaviour |
-|---|---|
-| `endpoint_name` | 1–32 ASCII characters matching `[A-Za-z0-9][A-Za-z0-9_-]{0,31}` |
-| `token` | Exactly 32 lowercase hexadecimal characters; included in the canonical address |
+`close()` is valid in every state, cancels a pending attempt or active session, unblocks transport and dispatcher waits, joins owned workers, and is idempotent.
 
 Important defaults:
 
 | Field | Default |
 |---|---|
-| `max_sessions` | `1` |
 | `supported_encodings` | MessagePack, then JSON |
 | `supported_capabilities` | `CAP_CORRELATION` |
+| `connect_timeout` | 10 seconds |
+| `application_queue_capacity` | 64 application events |
 | heartbeat | 30 seconds, three missed intervals |
-| fragmentation | 15-second timeout, 16 active sequences per session |
+| fragmentation | 15-second timeout, 16 active sequences |
 
-`expected_pid` is optional. When absent, PID filtering is disabled. When present, the wire PID must match the configured value and any trustworthy peer PID exposed by the platform. Token-bearing addresses and OS permissions remain the primary controls.
+`expected_go_pid` is an optional additional check. When present, it must match the handshake PID and any trustworthy peer PID exposed by the platform.
 
-## Sessions and sends
+## Sessions, sends, and events
 
-Each connected event exposes an immutable encoding, capability mask, and `SessionHandle`. The handle contains both `session_id` and `epoch`; a handle from an earlier connection cannot address a replacement session.
+The immutable `SessionView` contains `session_id`, local `epoch`, negotiated encoding, and capabilities. Public `send()` targets the current epoch and accepts only `Channel::Log` and `Channel::Data`. Correlated inbound messages carry a single-use, epoch-bound `Responder` that always replies on `Data` with the original correlation ID.
 
-Applications may send only:
-
-- `Channel::Log`
-- `Channel::Data`
-
-Control traffic and client-to-engine `Channel::Command` are rejected by the public send surface. A correlated send additionally requires `CAP_CORRELATION` in that session.
-
-Sequential calls for the same session are serialized. Concurrent calls follow write-mutex acquisition order. A session failure never redirects output to or closes another session.
-
-## Event execution
-
-For one session, callbacks start in this order:
+Callbacks for one epoch are ordered and never overlap:
 
 ```text
-session connected
-zero or more message/error callbacks
-session disconnected
+connected
+zero or more message, heartbeat, or error events
+disconnected
 ```
 
-Callbacks for one session are serialized. Callbacks for different sessions may run concurrently on their session or maintenance workers, so shared application state needs synchronization. Handlers must not throw. Because `close()` waits for callback completion, synchronous close from inside a callback is rejected; schedule it on the application lifecycle thread.
+Application delivery runs on a serial dispatcher separate from IPC. When its bounded capacity is exhausted, accepted events drain in order, then a reserved backpressure error and the terminal disconnected event are delivered.
 
-## Platform transport and security
+## Platform transport and ownership
 
-| Platform | Transport | Security |
+| Platform | Engine transport | Endpoint owner |
 |---|---|---|
-| Linux/macOS | Unix domain stream socket under the OS temporary directory | Socket node mode `0600` |
-| Windows | Byte-stream Named Pipe with multiple instances | Current-user SID ACL and `PIPE_REJECT_REMOTE_CLIENTS` |
+| Linux/macOS | Unix domain byte stream at the canonical hashed temporary path | Go client |
+| Windows | Byte-stream Named Pipe at the canonical token-bearing name | Go client |
 
-Canonical addresses are:
+The C++ engine never binds, listens, accepts, probes liveness, removes stale endpoints, changes Unix modes, or owns Named Pipe ACLs. The private testkit contains a Go-role listener solely to execute the shared conformance contract and is not installed or published.
+
+## Example
+
+Build target `yuumi_cpp_engine` from `examples/cpp_engine/main.cpp`, then start it with values supplied by the Go application:
 
 ```text
-Linux/macOS: <os_temp_dir>/yuumi-<endpoint_name>-<token>.sock
-Windows:     \\.\pipe\yuumi-<endpoint_name>-<token>
+cpp_engine <endpoint_name> <token> [expected_go_pid]
 ```
 
-The engine probes by connecting before replacing an endpoint. A live or busy owner is never removed; a refused stale Unix socket is unlinked before bind.
-
-## Conformance
-
-CTest registers `yuumi_EC-001` through `yuumi_EC-064`, matching `ENGINE_CONFORMANCE.md`. The private test peer can send exact bytes and inspect transport controls, but remains test-only and is not a public non-Go client SDK.
-
-## Compatibility alias
-
-`ServerBridge` and `Bridge` are aliases for `Engine`. The old `start(pipe_name, expected_pid)` and sessionless `send(payload, channel)` signatures were removed because they cannot supply the mandatory token or target one isolated session safely.
+Process lifecycle and restart policy remain application responsibilities.
 
 ## Issues
 

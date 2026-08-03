@@ -18,12 +18,15 @@
       "name": "windows-msvc-debug",
       "inherits": "base",
       "generator": "Visual Studio 17 2022",
-      "architecture": {
-        "value": "x64"
-      },
-      "cacheVariables": {
-        "CMAKE_CONFIGURATION_TYPES": "Debug"
-      }
+      "architecture": {"value": "x64"},
+      "cacheVariables": {"CMAKE_CONFIGURATION_TYPES": "Debug"}
+    },
+    {
+      "name": "windows-msvc-release",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {"value": "x64"},
+      "cacheVariables": {"CMAKE_CONFIGURATION_TYPES": "Release"}
     },
     {
       "name": "linux-clang-debug",
@@ -36,6 +39,27 @@
       }
     },
     {
+      "name": "linux-clang-release",
+      "inherits": "linux-clang-debug",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
+    },
+    {
+      "name": "linux-clang-address",
+      "inherits": "linux-clang-debug",
+      "cacheVariables": {
+        "YUUMI_BUILD_EXAMPLES": "OFF",
+        "YUUMI_SANITIZER": "address"
+      }
+    },
+    {
+      "name": "linux-clang-thread",
+      "inherits": "linux-clang-debug",
+      "cacheVariables": {
+        "YUUMI_BUILD_EXAMPLES": "OFF",
+        "YUUMI_SANITIZER": "thread"
+      }
+    },
+    {
       "name": "macos-clang-debug",
       "inherits": "base",
       "generator": "Ninja",
@@ -44,36 +68,31 @@
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++"
       }
+    },
+    {
+      "name": "macos-clang-release",
+      "inherits": "macos-clang-debug",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
     }
   ],
   "buildPresets": [
-    {
-      "name": "windows-msvc-debug-build",
-      "configurePreset": "windows-msvc-debug",
-      "configuration": "Debug"
-    },
-    {
-      "name": "linux-clang-debug-build",
-      "configurePreset": "linux-clang-debug"
-    },
-    {
-      "name": "macos-clang-debug-build",
-      "configurePreset": "macos-clang-debug"
-    }
+    {"name": "windows-msvc-debug-build", "configurePreset": "windows-msvc-debug", "configuration": "Debug"},
+    {"name": "windows-msvc-release-build", "configurePreset": "windows-msvc-release", "configuration": "Release"},
+    {"name": "linux-clang-debug-build", "configurePreset": "linux-clang-debug"},
+    {"name": "linux-clang-release-build", "configurePreset": "linux-clang-release"},
+    {"name": "linux-clang-address-build", "configurePreset": "linux-clang-address"},
+    {"name": "linux-clang-thread-build", "configurePreset": "linux-clang-thread"},
+    {"name": "macos-clang-debug-build", "configurePreset": "macos-clang-debug"},
+    {"name": "macos-clang-release-build", "configurePreset": "macos-clang-release"}
   ],
   "testPresets": [
-    {
-      "name": "windows-msvc-debug-test",
-      "configurePreset": "windows-msvc-debug",
-      "configuration": "Debug"
-    },
-    {
-      "name": "linux-clang-debug-test",
-      "configurePreset": "linux-clang-debug"
-    },
-    {
-      "name": "macos-clang-debug-test",
-      "configurePreset": "macos-clang-debug"
-    }
+    {"name": "windows-msvc-debug-test", "configurePreset": "windows-msvc-debug", "configuration": "Debug"},
+    {"name": "windows-msvc-release-test", "configurePreset": "windows-msvc-release", "configuration": "Release"},
+    {"name": "linux-clang-debug-test", "configurePreset": "linux-clang-debug"},
+    {"name": "linux-clang-release-test", "configurePreset": "linux-clang-release"},
+    {"name": "linux-clang-address-test", "configurePreset": "linux-clang-address"},
+    {"name": "linux-clang-thread-test", "configurePreset": "linux-clang-thread"},
+    {"name": "macos-clang-debug-test", "configurePreset": "macos-clang-debug"},
+    {"name": "macos-clang-release-test", "configurePreset": "macos-clang-release"}
   ]
 }

@@ -16,25 +16,24 @@ public:
         static_cast<void>(impl_->close());
     }
 
-    Result<> open() {
-        return impl_->open();
+    Result<SessionView> connect() {
+        return impl_->connect();
     }
 
     Result<> close() {
         return impl_->close();
     }
 
-    Result<> send(const SessionHandle& session, Channel channel, const Json& payload) {
-        return impl_->send(session, channel, payload, std::nullopt);
+    Result<> send(Channel channel, const Json& payload) {
+        return impl_->send(channel, payload);
     }
 
-    Result<> send_correlated(
-        const SessionHandle& session,
-        Channel channel,
-        std::uint32_t correlation_id,
-        const Json& payload
-    ) {
-        return impl_->send(session, channel, payload, correlation_id);
+    EngineState state() const {
+        return impl_->state();
+    }
+
+    std::optional<SessionView> session() const {
+        return impl_->session();
     }
 
     void on_session_connected(SessionConnectedHandler handler) {
@@ -45,6 +44,11 @@ public:
     void on_message(MessageHandler handler) {
         std::lock_guard lock(impl_->handler_mutex);
         impl_->message_handler = std::move(handler);
+    }
+
+    void on_heartbeat(HeartbeatHandler handler) {
+        std::lock_guard lock(impl_->handler_mutex);
+        impl_->heartbeat_handler = std::move(handler);
     }
 
     void on_error(ErrorHandler handler) {
@@ -67,17 +71,10 @@ private:
     std::shared_ptr<detail::EngineImpl> impl_;
 };
 
-using ServerBridge = Engine;
-using Bridge = Engine;
-
 }
 
 /*
- * Engine::open returns once the secured endpoint can accept clients.
- * Every send requires a live generation-aware SessionHandle and accepts only
- * Log or Data. Sequential same-session sends are serialized; concurrent sends
- * follow mutex acquisition order. Callbacks for one session are serialized,
- * while callbacks for separate sessions may execute concurrently.
- * Synchronous close is rejected from callbacks because close waits for callback
- * completion; schedule it on the application lifecycle thread instead.
+ * Engine::connect performs one bounded dial and returns only after ACK and
+ * session assignment are written. Public sends target the current epoch and
+ * accept only Log or Data; correlated replies use the event Responder.
  */

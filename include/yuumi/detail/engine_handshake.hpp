@@ -4,15 +4,21 @@
 
 namespace yuumi::detail {
 
-inline Result<> EngineImpl::establish(const std::shared_ptr<EngineSession>& session) {
+inline Result<SessionView> EngineImpl::establish(
+    const std::shared_ptr<Stream>& stream,
+    const EngineConfig& config,
+    Deadline deadline
+) {
     std::array<std::byte, 16> handshake{};
-    const auto read = session->stream->read_exact(handshake);
+    const auto read = stream->read_exact(handshake, deadline);
     if (read.state != IoState::Complete) {
         return unexpected(Protocol::error(
-            ErrorCategory::Handshake,
-            read.state == IoState::Closed ? StatusCode::ERR_CONNECTION_LOST : StatusCode::ERR_READ_TIMEOUT,
-            ErrorPhase::HandshakeRead,
-            read.cause
+            read.state == IoState::TimedOut ? ErrorKind::Timeout : ErrorKind::Handshake,
+            read.cause,
+            read.state == IoState::TimedOut
+                ? StatusCode::ERR_READ_TIMEOUT
+                : StatusCode::ERR_CONNECTION_LOST,
+            ErrorPhase::HandshakeRead
         ));
     }
     const auto magic = Protocol::read_u32(std::span<const std::byte, 4>(handshake.data(), 4));
@@ -20,132 +26,124 @@ inline Result<> EngineImpl::establish(const std::shared_ptr<EngineSession>& sess
     const auto process_id = Protocol::read_u32(std::span<const std::byte, 4>(handshake.data() + 8, 4));
     if (magic != 0x59554D49) {
         return unexpected(Protocol::error(
-            ErrorCategory::Handshake,
+            ErrorKind::Handshake,
+            "handshake magic is invalid",
             StatusCode::ERR_MAGIC_MISMATCH,
-            ErrorPhase::HandshakeValidate,
-            "handshake magic does not match"
+            ErrorPhase::HandshakeValidate
         ));
     }
     if (version != PROTOCOL_VERSION) {
         return unexpected(Protocol::error(
-            ErrorCategory::Handshake,
+            ErrorKind::Handshake,
+            "handshake protocol version is incompatible",
             StatusCode::ERR_VERSION_MISMATCH,
-            ErrorPhase::HandshakeValidate,
-            "handshake protocol version is incompatible"
+            ErrorPhase::HandshakeValidate
         ));
     }
-    const auto authenticated_pid = session->stream->peer_pid();
-    if (config.expected_pid &&
-        (process_id != *config.expected_pid ||
-         (authenticated_pid && process_id != *authenticated_pid))) {
+    const auto authenticated_pid = stream->peer_pid();
+    if ((config.expected_go_pid && process_id != *config.expected_go_pid) ||
+        (authenticated_pid && process_id != *authenticated_pid)) {
         return unexpected(Protocol::error(
-            ErrorCategory::Handshake,
+            ErrorKind::Handshake,
+            "Go PID does not match expected or authenticated peer",
             StatusCode::ERR_PID_MISMATCH,
-            ErrorPhase::HandshakeValidate,
-            "handshake PID does not match the configured or authenticated peer"
+            ErrorPhase::HandshakeValidate
         ));
     }
     const auto encoding_mask = std::to_integer<std::uint8_t>(handshake[12]);
-    bool selected{};
-    for (const auto encoding : config.supported_encodings) {
-        if ((encoding_mask & static_cast<std::uint8_t>(encoding)) != 0) {
-            session->encoding = encoding;
-            selected = true;
+    std::optional<Encoding> encoding;
+    for (const auto candidate : config.supported_encodings) {
+        if ((encoding_mask & static_cast<std::uint8_t>(candidate)) != 0) {
+            encoding = candidate;
             break;
         }
     }
-    if (!selected) {
+    if (!encoding) {
         return unexpected(Protocol::error(
-            ErrorCategory::Handshake,
+            ErrorKind::Encoding,
+            "no common encoding exists",
             StatusCode::ERR_ENCODING_UNSUPPORTED,
-            ErrorPhase::HandshakeValidate,
-            "handshake has no supported encoding intersection"
+            ErrorPhase::HandshakeValidate
         ));
     }
-    const auto client_capabilities =
+    const auto peer_capabilities =
         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(handshake[13])) << 16U) |
         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(handshake[14])) << 8U) |
         static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(handshake[15]));
-    session->capabilities = client_capabilities & config.supported_capabilities & IMPLEMENTED_CAPABILITIES;
+    const auto capabilities =
+        peer_capabilities & config.supported_capabilities & IMPLEMENTED_CAPABILITIES;
     const std::array<std::byte, 4> acknowledgement{
-        static_cast<std::byte>(session->encoding),
-        static_cast<std::byte>((session->capabilities >> 16U) & 0xFFU),
-        static_cast<std::byte>((session->capabilities >> 8U) & 0xFFU),
-        static_cast<std::byte>(session->capabilities & 0xFFU)
+        static_cast<std::byte>(*encoding),
+        static_cast<std::byte>((capabilities >> 16U) & 0xFFU),
+        static_cast<std::byte>((capabilities >> 8U) & 0xFFU),
+        static_cast<std::byte>(capabilities & 0xFFU)
     };
     if (test_hooks && test_hooks->fail_ack_write.exchange(false, std::memory_order_acq_rel)) {
         return unexpected(Protocol::error(
-            ErrorCategory::Transport,
+            ErrorKind::Handshake,
+            "injected ACK write failure",
             StatusCode::ERR_WRITE_FAILED,
-            ErrorPhase::AckWrite,
-            "injected ACK write failure"
+            ErrorPhase::AckWrite
         ));
     }
-    const auto ack_write = session->stream->write_exact(acknowledgement);
+    const auto ack_write = stream->write_exact(acknowledgement, deadline);
     if (ack_write.state != IoState::Complete) {
         return unexpected(Protocol::error(
-            ErrorCategory::Transport,
-            StatusCode::ERR_WRITE_FAILED,
-            ErrorPhase::AckWrite,
-            ack_write.cause
+            ack_write.state == IoState::TimedOut ? ErrorKind::Timeout : ErrorKind::Handshake,
+            ack_write.cause,
+            ack_write.state == IoState::TimedOut
+                ? StatusCode::ERR_READ_TIMEOUT
+                : StatusCode::ERR_WRITE_FAILED,
+            ErrorPhase::AckWrite
         ));
     }
-    session->handle.session_id = session_identifier(next_session_id.fetch_add(1, std::memory_order_relaxed));
+    const auto session_id = session_identifier(next_session_id.fetch_add(1, std::memory_order_relaxed));
     auto assignment = Protocol::control_frame(Json{
         {"type", "session"},
-        {"session_id", session->handle.session_id}
+        {"session_id", session_id}
     });
     if (!assignment) {
         auto failure = assignment.error();
+        failure.kind = ErrorKind::Handshake;
         failure.phase = ErrorPhase::SessionWrite;
         return unexpected(std::move(failure));
     }
     if (test_hooks && test_hooks->fail_session_write.exchange(false, std::memory_order_acq_rel)) {
         return unexpected(Protocol::error(
-            ErrorCategory::Transport,
+            ErrorKind::Handshake,
+            "injected session assignment write failure",
             StatusCode::ERR_WRITE_FAILED,
-            ErrorPhase::SessionWrite,
-            "injected session write failure"
+            ErrorPhase::SessionWrite
         ));
     }
-    const auto session_write = session->stream->write_exact(*assignment);
+    const auto session_write = stream->write_exact(*assignment, deadline);
     if (session_write.state != IoState::Complete) {
         return unexpected(Protocol::error(
-            ErrorCategory::Transport,
-            StatusCode::ERR_WRITE_FAILED,
-            ErrorPhase::SessionWrite,
-            session_write.cause
+            session_write.state == IoState::TimedOut ? ErrorKind::Timeout : ErrorKind::Handshake,
+            session_write.cause,
+            session_write.state == IoState::TimedOut
+                ? StatusCode::ERR_READ_TIMEOUT
+                : StatusCode::ERR_WRITE_FAILED,
+            ErrorPhase::SessionWrite
         ));
     }
-    session->handle.epoch = next_epoch.fetch_add(1, std::memory_order_relaxed);
-    const auto now = ticks(std::chrono::steady_clock::now());
-    session->last_activity.store(now, std::memory_order_release);
-    session->last_heartbeat.store(now, std::memory_order_release);
-    {
-        std::lock_guard sessions_lock(sessions_mutex);
-        sessions.emplace(session->handle.session_id, session);
-    }
-    session->established.store(true, std::memory_order_release);
-    emit_connected(session);
-    return {};
+    return SessionView{
+        session_id,
+        next_epoch.load(std::memory_order_acquire) + 1,
+        *encoding,
+        capabilities
+    };
 }
 
-inline void EngineImpl::session_loop(const std::shared_ptr<EngineSession>& session) {
-    auto established = establish(session);
-    if (!established) {
-        emit_error(established.error());
-        session->stream->close();
-        release_session(session);
-        return;
-    }
+inline void EngineImpl::reader_loop(const std::shared_ptr<EngineSession>& session) {
     while (!session->close_requested.load(std::memory_order_acquire)) {
         if (test_hooks && test_hooks->fail_frame_read.exchange(false, std::memory_order_acq_rel)) {
-            report_terminal(session, Protocol::error(
-                ErrorCategory::Transport,
+            set_terminal(session, DisconnectReason::TransportFailure, Protocol::error(
+                ErrorKind::Transport,
+                "injected established-session read failure",
                 StatusCode::ERR_CONNECTION_LOST,
                 ErrorPhase::FrameRead,
-                "injected established-session read failure",
-                session->handle
+                session->view.epoch
             ));
             request_close(session, DisconnectReason::TransportFailure);
             break;
@@ -157,12 +155,12 @@ inline void EngineImpl::session_loop(const std::shared_ptr<EngineSession>& sessi
                 if (header_read.state == IoState::Closed) {
                     request_close(session, DisconnectReason::PeerClose);
                 } else {
-                    report_terminal(session, Protocol::error(
-                        ErrorCategory::Transport,
+                    set_terminal(session, DisconnectReason::TransportFailure, Protocol::error(
+                        ErrorKind::Transport,
+                        header_read.cause,
                         StatusCode::ERR_CONNECTION_LOST,
                         ErrorPhase::FrameRead,
-                        header_read.cause,
-                        session->handle
+                        session->view.epoch
                     ));
                     request_close(session, DisconnectReason::TransportFailure);
                 }
@@ -171,7 +169,12 @@ inline void EngineImpl::session_loop(const std::shared_ptr<EngineSession>& sessi
         }
         const auto payload_size = Protocol::read_u32(std::span<const std::byte, 4>(header.data(), 4));
         if (payload_size > MAX_MESSAGE_SIZE) {
-            protocol_failure(session, StatusCode::ERR_PAYLOAD_TOO_LARGE, "payload exceeds 16 MiB");
+            protocol_failure(
+                session,
+                StatusCode::ERR_PAYLOAD_TOO_LARGE,
+                ErrorPhase::FrameDecode,
+                "frame payload exceeds 16 MiB"
+            );
             break;
         }
         if (test_hooks) {
@@ -186,12 +189,12 @@ inline void EngineImpl::session_loop(const std::shared_ptr<EngineSession>& sessi
         std::vector<std::byte> payload(payload_size);
         const auto payload_read = session->stream->read_exact(payload);
         if (payload_read.state != IoState::Complete) {
-            report_terminal(session, Protocol::error(
-                ErrorCategory::Transport,
+            set_terminal(session, DisconnectReason::TransportFailure, Protocol::error(
+                ErrorKind::Transport,
+                payload_read.cause,
                 StatusCode::ERR_CONNECTION_LOST,
                 ErrorPhase::FrameRead,
-                payload_read.cause,
-                session->handle
+                session->view.epoch
             ));
             request_close(session, DisconnectReason::TransportFailure);
             break;
@@ -204,27 +207,13 @@ inline void EngineImpl::session_loop(const std::shared_ptr<EngineSession>& sessi
         session->last_activity.store(ticks(std::chrono::steady_clock::now()), std::memory_order_release);
     }
     session->stream->close();
-    if (session->established.load(std::memory_order_acquire)) {
-        emit_disconnected(session);
-    }
-    release_session(session);
-}
-
-inline void EngineImpl::release_session(const std::shared_ptr<EngineSession>& session) {
-    std::lock_guard sessions_lock(sessions_mutex);
-    if (!session->handle.session_id.empty()) {
-        const auto iterator = sessions.find(session->handle.session_id);
-        if (iterator != sessions.end() && iterator->second == session) {
-            sessions.erase(iterator);
-        }
-    }
-    connections.erase(session);
+    finalize_session(session);
 }
 
 }
 
 /*
- * A connection remains pre-session until its exact handshake, ACK, and session
- * assignment writes succeed. Capacity is released after teardown, while epoch
- * allocation occurs only for a fully established visible session.
+ * Establishment reads exactly one handshake before parsing, writes ACK before
+ * assignment, and creates an epoch only after both writes complete. Invalid
+ * candidates never enter connected state or emit lifecycle events.
  */

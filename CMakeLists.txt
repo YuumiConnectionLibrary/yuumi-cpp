@@ -11,7 +11,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(yuumi
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Yuumi C++ engine SDK"
     LANGUAGES CXX
 )
@@ -41,8 +41,20 @@ target_link_libraries(yuumi_cpp INTERFACE
     nlohmann_json::nlohmann_json
 )
 
-if(WIN32)
-    target_link_libraries(yuumi_cpp INTERFACE advapi32)
+set(YUUMI_SANITIZER "" CACHE STRING "Sanitizer mode: empty, address, or thread")
+set_property(CACHE YUUMI_SANITIZER PROPERTY STRINGS "" address thread)
+if(YUUMI_SANITIZER)
+    if(MSVC)
+        message(FATAL_ERROR "YUUMI_SANITIZER presets require Clang or GCC")
+    elseif(YUUMI_SANITIZER STREQUAL "address")
+        target_compile_options(yuumi_cpp INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(yuumi_cpp INTERFACE -fsanitize=address,undefined)
+    elseif(YUUMI_SANITIZER STREQUAL "thread")
+        target_compile_options(yuumi_cpp INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(yuumi_cpp INTERFACE -fsanitize=thread)
+    else()
+        message(FATAL_ERROR "YUUMI_SANITIZER must be empty, address, or thread")
+    endif()
 endif()
 
 option(YUUMI_BUILD_TESTS "Build Yuumi test applications" ON)
@@ -89,7 +101,7 @@ if(YUUMI_BUILD_TESTS)
         target_compile_options(yuumi_engine_conformance PRIVATE -Wall -Wextra -pedantic)
     endif()
 
-    foreach(case_number RANGE 1 64)
+    foreach(case_number RANGE 1 25)
         if(case_number LESS 10)
             set(case_id "00${case_number}")
         else()
@@ -102,20 +114,20 @@ if(YUUMI_BUILD_TESTS)
         set_tests_properties("yuumi_EC-${case_id}" PROPERTIES TIMEOUT 15)
     endforeach()
 
-    message(STATUS "Yuumi Engine Conformance EC-001 through EC-064 enabled.")
+    message(STATUS "Yuumi Engine Conformance EC-001 through EC-025 enabled.")
 endif()
 
-if(YUUMI_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp_server/main.cpp")
-    add_executable(yuumi_cpp_server examples/cpp_server/main.cpp)
-    target_link_libraries(yuumi_cpp_server PRIVATE yuumi::cpp)
+if(YUUMI_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp_engine/main.cpp")
+    add_executable(yuumi_cpp_engine examples/cpp_engine/main.cpp)
+    target_link_libraries(yuumi_cpp_engine PRIVATE yuumi::cpp)
 
     if(MSVC)
-        target_compile_options(yuumi_cpp_server PRIVATE /W4 /permissive-)
+        target_compile_options(yuumi_cpp_engine PRIVATE /W4 /permissive-)
     else()
-        target_compile_options(yuumi_cpp_server PRIVATE -Wall -Wextra -pedantic)
+        target_compile_options(yuumi_cpp_engine PRIVATE -Wall -Wextra -pedantic)
     endif()
 
-    message(STATUS "Yuumi cpp_server example enabled.")
+    message(STATUS "Yuumi cpp_engine example enabled.")
 endif()
 
 message(STATUS "yuumi v${PROJECT_VERSION} configured successfully.")

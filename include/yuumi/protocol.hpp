@@ -46,10 +46,10 @@ public:
                 raw.assign(text.begin(), text.end());
             } else {
                 return unexpected(error(
-                    ErrorCategory::Serialization,
+                    ErrorKind::Encoding,
+                    "selected encoding is not supported",
                     StatusCode::ERR_ENCODING_UNSUPPORTED,
-                    ErrorPhase::ApplicationSend,
-                    "selected encoding is not supported"
+                    ErrorPhase::ApplicationSend
                 ));
             }
             std::vector<std::byte> bytes(raw.size());
@@ -59,10 +59,10 @@ public:
             return bytes;
         } catch (const nlohmann::json::exception& exception) {
             return unexpected(error(
-                ErrorCategory::Serialization,
+                ErrorKind::Encoding,
+                exception.what(),
                 StatusCode::ERR_PROTOCOL_VIOLATION,
-                ErrorPhase::ApplicationSend,
-                exception.what()
+                ErrorPhase::ApplicationSend
             ));
         }
     }
@@ -79,17 +79,17 @@ public:
                 );
             }
             return unexpected(error(
-                ErrorCategory::Protocol,
+                ErrorKind::Encoding,
+                "selected encoding is not supported",
                 StatusCode::ERR_ENCODING_UNSUPPORTED,
-                ErrorPhase::FrameDecode,
-                "selected encoding is not supported"
+                ErrorPhase::FrameDecode
             ));
         } catch (const nlohmann::json::exception& exception) {
             return unexpected(error(
-                ErrorCategory::Protocol,
+                ErrorKind::Encoding,
+                exception.what(),
                 StatusCode::ERR_PROTOCOL_VIOLATION,
-                ErrorPhase::FrameDecode,
-                exception.what()
+                ErrorPhase::FrameDecode
             ));
         }
     }
@@ -105,10 +105,10 @@ public:
     ) {
         if (payload.size() > MAX_MESSAGE_SIZE) {
             return unexpected(error(
-                ErrorCategory::Serialization,
+                ErrorKind::Protocol,
+                "frame payload exceeds 16 MiB",
                 StatusCode::ERR_PAYLOAD_TOO_LARGE,
-                ErrorPhase::ApplicationSend,
-                "frame payload exceeds 16 MiB"
+                ErrorPhase::ApplicationSend
             ));
         }
         std::vector<std::byte> packet;
@@ -129,13 +129,13 @@ public:
     }
 
     static ErrorInfo error(
-        ErrorCategory category,
-        StatusCode status,
-        ErrorPhase phase,
+        ErrorKind kind,
         std::string cause,
-        std::optional<SessionHandle> session = std::nullopt
+        std::optional<StatusCode> status = std::nullopt,
+        std::optional<ErrorPhase> phase = std::nullopt,
+        std::optional<std::uint64_t> epoch = std::nullopt
     ) {
-        return ErrorInfo{category, status, phase, std::move(cause), std::move(session)};
+        return ErrorInfo{kind, std::move(cause), status, phase, epoch};
     }
 };
 

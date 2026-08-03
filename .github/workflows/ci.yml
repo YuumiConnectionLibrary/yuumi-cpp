@@ -23,20 +23,45 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: windows-amd64
+          - label: windows-amd64-debug
             os: windows-latest
             configure-preset: windows-msvc-debug
             build-preset: windows-msvc-debug-build
             compiler_launcher: sccache
-          - label: linux-amd64
+          - label: windows-amd64-release
+            os: windows-latest
+            configure-preset: windows-msvc-release
+            build-preset: windows-msvc-release-build
+            compiler_launcher: sccache
+          - label: linux-amd64-debug
             os: ubuntu-latest
             configure-preset: linux-clang-debug
             build-preset: linux-clang-debug-build
             compiler_launcher: ccache
-          - label: macos-arm64
+          - label: linux-amd64-release
+            os: ubuntu-latest
+            configure-preset: linux-clang-release
+            build-preset: linux-clang-release-build
+            compiler_launcher: ccache
+          - label: linux-amd64-address
+            os: ubuntu-latest
+            configure-preset: linux-clang-address
+            build-preset: linux-clang-address-build
+            compiler_launcher: ccache
+          - label: linux-amd64-thread
+            os: ubuntu-latest
+            configure-preset: linux-clang-thread
+            build-preset: linux-clang-thread-build
+            compiler_launcher: ccache
+          - label: macos-arm64-debug
             os: macos-latest
             configure-preset: macos-clang-debug
             build-preset: macos-clang-debug-build
+            compiler_launcher: ccache
+          - label: macos-arm64-release
+            os: macos-latest
+            configure-preset: macos-clang-release
+            build-preset: macos-clang-release-build
             compiler_launcher: ccache
 
     env:
@@ -132,5 +157,3 @@ jobs:
 
       - name: Engine conformance
         run: ctest --preset ${{ matrix.configure-preset }}-test --output-on-failure
-
-# creato: 2026-05-25 | CI GitHub Actions | yuumi-cpp
