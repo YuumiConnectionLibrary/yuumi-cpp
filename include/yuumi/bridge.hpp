@@ -4,6 +4,12 @@
 
 namespace yuumi {
 
+#ifdef YUUMI_ENABLE_TESTKIT
+namespace detail {
+struct EngineTestAccess;
+}
+#endif
+
 class Engine {
 public:
     explicit Engine(EngineConfig config)
@@ -61,13 +67,10 @@ public:
         impl_->disconnected_handler = std::move(handler);
     }
 
-#ifdef YUUMI_ENABLE_TESTKIT
-    void install_test_hooks(std::shared_ptr<detail::EngineTestHooks> hooks) {
-        impl_->test_hooks = std::move(hooks);
-    }
-#endif
-
 private:
+#ifdef YUUMI_ENABLE_TESTKIT
+    friend struct detail::EngineTestAccess;
+#endif
     std::shared_ptr<detail::EngineImpl> impl_;
 };
 

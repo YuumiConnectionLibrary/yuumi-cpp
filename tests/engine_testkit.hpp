@@ -23,7 +23,24 @@
 #include <unistd.h>
 #endif
 
+namespace yuumi::detail {
+
+struct EngineTestAccess {
+    static void install(Engine& engine, std::shared_ptr<EngineTestHooks> hooks) {
+        engine.impl_->test_hooks = std::move(hooks);
+    }
+};
+
+}
+
 namespace yuumi::testkit {
+
+inline constexpr auto TEST_TIMEOUT = std::chrono::seconds(2);
+inline constexpr auto POLL_INTERVAL = std::chrono::milliseconds(5);
+
+inline void install_test_hooks(Engine& engine, std::shared_ptr<detail::EngineTestHooks> hooks) {
+    detail::EngineTestAccess::install(engine, std::move(hooks));
+}
 
 class Failure : public std::runtime_error {
 public:
@@ -64,7 +81,7 @@ inline EngineConfig config() {
     result.endpoint_name = "ct-" + hex8(process_id()) + "-" + hex8(value);
     result.token = std::string(24, '0') + hex8(value);
     result.heartbeat.disabled = true;
-    result.connect_timeout = std::chrono::seconds(2);
+    result.connect_timeout = TEST_TIMEOUT;
     return result;
 }
 
@@ -345,18 +362,18 @@ struct Events {
     template <typename Predicate>
     void wait(Predicate predicate, std::string message) {
         std::unique_lock lock(mutex);
-        require(changed.wait_for(lock, std::chrono::seconds(3), predicate), std::move(message));
+        require(changed.wait_for(lock, TEST_TIMEOUT, predicate), std::move(message));
     }
 };
 
 template <typename Predicate>
 inline void wait_until(Predicate predicate, std::string message) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    const auto deadline = std::chrono::steady_clock::now() + TEST_TIMEOUT;
     while (!predicate()) {
         if (std::chrono::steady_clock::now() >= deadline) {
             throw Failure(std::move(message));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(POLL_INTERVAL);
     }
 }
 

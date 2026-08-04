@@ -49,7 +49,7 @@ inline void case_configuration() {
     value.endpoint_name.clear();
     Engine engine(value);
     auto hooks = std::make_shared<detail::EngineTestHooks>();
-    engine.install_test_hooks(hooks);
+    install_test_hooks(engine, hooks);
     const auto result = engine.connect();
     require(!result && result.error().kind == ErrorKind::Configuration, "invalid config was not typed");
     require(hooks->dial_attempts.load() == 0, "invalid config dialed");
@@ -151,7 +151,7 @@ inline void case_establishment_failure() {
     Engine engine(value);
     auto hooks = std::make_shared<detail::EngineTestHooks>();
     hooks->fail_ack_write.store(true);
-    engine.install_test_hooks(hooks);
+    install_test_hooks(engine, hooks);
     const auto result = rejected_handshake(engine, listener, handshake());
     require(result.error().phase == ErrorPhase::AckWrite, "ACK failure phase mismatch");
     require(!engine.session(), "failed establishment exposed a session");
@@ -436,7 +436,9 @@ inline std::string public_headers() {
 
 inline void case_public_surface() {
     const auto headers = public_headers();
-    for (const auto forbidden : {"class Listener", "ServerBridge", "using Bridge", "max_sessions", "accept_loop"}) {
+    for (const auto forbidden : {
+        "class Listener", "ServerBridge", "using Bridge", "max_sessions", "accept_loop", "install_test_hooks"
+    }) {
         require(headers.find(forbidden) == std::string::npos, std::string("legacy public symbol remains: ") + forbidden);
     }
 }
