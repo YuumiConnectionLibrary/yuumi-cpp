@@ -25,6 +25,16 @@ ctest --preset linux-clang-debug-test --output-on-failure
 
 Replace `debug` with `release` for optimized verification. Equivalent `windows-msvc-*` and `macos-clang-*` presets run the same EC-001 through EC-025 cases. Linux also provides `linux-clang-address` for AddressSanitizer plus UndefinedBehaviorSanitizer and `linux-clang-thread` for ThreadSanitizer.
 
+On WSL, the repository can provision its pinned vcpkg checkout without sudo and
+run conformance plus the real Go-to-C++ integration cell:
+
+```bash
+bash scripts/verify-wsl.sh
+```
+
+The checkout lives in the ignored `vcpkg/` directory. The script rejects an
+existing checkout at a different commit instead of changing it implicitly.
+
 ## Engine configuration
 
 ```cpp
@@ -100,6 +110,20 @@ cpp_engine <endpoint_name> <token> [expected_go_pid]
 ```
 
 Process lifecycle and restart policy remain application responsibilities.
+
+## Verification
+
+After configuring a supported CMake preset, build and run CTest:
+
+    cmake --build --preset <build-preset>
+    ctest --preset <test-preset> --output-on-failure
+
+The standalone CTest run executes the 25 canonical Engine cases. To add the
+real Go-to-C++ cell, configure with YUUMI_BUILD_INTEROP_TESTS=ON, then build and
+run the same CTest preset. This adds yuumi_go_integration, which starts the
+private yuumi_interop_engine fixture and delegates the common scenarios to the
+tagged Go driver. A missing sibling Yuumi checkout is an error. The fixture is
+a test target and is not installed.
 
 ## Issues
 

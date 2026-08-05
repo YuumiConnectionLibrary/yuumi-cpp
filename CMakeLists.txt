@@ -59,6 +59,7 @@ endif()
 
 option(YUUMI_BUILD_TESTS "Build Yuumi test applications" ON)
 option(YUUMI_BUILD_EXAMPLES "Build Yuumi example applications" ON)
+option(YUUMI_BUILD_INTEROP_TESTS "Build real Go-to-C++ integration tests" OFF)
 
 if(YUUMI_BUILD_TESTS)
     enable_testing()
@@ -113,6 +114,33 @@ if(YUUMI_BUILD_TESTS)
         )
         set_tests_properties("yuumi_EC-${case_id}" PROPERTIES TIMEOUT 15)
     endforeach()
+
+    if(YUUMI_BUILD_INTEROP_TESTS)
+        file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../Yuumi" YUUMI_GO_SDK_DIR)
+        if(NOT EXISTS "${YUUMI_GO_SDK_DIR}/go.mod")
+            message(FATAL_ERROR "YUUMI_BUILD_INTEROP_TESTS requires the sibling Yuumi Go checkout")
+        endif()
+        add_executable(yuumi_interop_engine tests/interop_engine.cpp)
+        target_link_libraries(yuumi_interop_engine PRIVATE yuumi::cpp)
+        if(MSVC)
+            target_compile_options(yuumi_interop_engine PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(yuumi_interop_engine PRIVATE -Wall -Wextra -pedantic)
+        endif()
+        add_test(
+            NAME yuumi_go_integration
+            COMMAND
+                ${CMAKE_COMMAND} -E env
+                "YUUMI_INTEROP_COMMAND={\"executable\":\"$<TARGET_FILE:yuumi_interop_engine>\",\"arguments\":[],\"engine\":\"cpp\"}"
+                go test -tags=interop -run ^TestGoEngineInterop$ -count=1 -timeout 150s
+        )
+        set_tests_properties(
+            yuumi_go_integration
+            PROPERTIES
+                WORKING_DIRECTORY "${YUUMI_GO_SDK_DIR}"
+                TIMEOUT 180
+        )
+    endif()
 
     message(STATUS "Yuumi Engine Conformance EC-001 through EC-025 enabled.")
 endif()

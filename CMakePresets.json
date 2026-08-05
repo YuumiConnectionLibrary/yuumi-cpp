@@ -44,6 +44,15 @@
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
     },
     {
+      "name": "wsl-clang-debug",
+      "inherits": "linux-clang-debug",
+      "cacheVariables": {
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
+        "YUUMI_BUILD_EXAMPLES": "OFF",
+        "YUUMI_BUILD_INTEROP_TESTS": "ON"
+      }
+    },
+    {
       "name": "linux-clang-address",
       "inherits": "linux-clang-debug",
       "cacheVariables": {
@@ -80,6 +89,7 @@
     {"name": "windows-msvc-release-build", "configurePreset": "windows-msvc-release", "configuration": "Release"},
     {"name": "linux-clang-debug-build", "configurePreset": "linux-clang-debug"},
     {"name": "linux-clang-release-build", "configurePreset": "linux-clang-release"},
+    {"name": "wsl-clang-debug-build", "configurePreset": "wsl-clang-debug"},
     {"name": "linux-clang-address-build", "configurePreset": "linux-clang-address"},
     {"name": "linux-clang-thread-build", "configurePreset": "linux-clang-thread"},
     {"name": "macos-clang-debug-build", "configurePreset": "macos-clang-debug"},
@@ -90,6 +100,7 @@
     {"name": "windows-msvc-release-test", "configurePreset": "windows-msvc-release", "configuration": "Release"},
     {"name": "linux-clang-debug-test", "configurePreset": "linux-clang-debug"},
     {"name": "linux-clang-release-test", "configurePreset": "linux-clang-release"},
+    {"name": "wsl-clang-debug-test", "configurePreset": "wsl-clang-debug"},
     {"name": "linux-clang-address-test", "configurePreset": "linux-clang-address"},
     {"name": "linux-clang-thread-test", "configurePreset": "linux-clang-thread"},
     {"name": "macos-clang-debug-test", "configurePreset": "macos-clang-debug"},
