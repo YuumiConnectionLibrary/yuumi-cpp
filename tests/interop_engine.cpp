@@ -180,7 +180,11 @@ int main() {
             const auto stale = old_responder
                 ? old_responder->respond({{"unexpected", true}})
                 : yuumi::Result<>{yuumi::unexpected(yuumi::ErrorInfo{
-                      yuumi::ErrorKind::Internal, "missing captured responder"
+                      yuumi::ErrorKind::Internal,
+                      "missing captured responder",
+                      std::nullopt,
+                      std::nullopt,
+                      std::nullopt
                   })};
             const auto invalid_send = engine.send(
                 yuumi::Channel::Command,

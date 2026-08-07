@@ -10,6 +10,9 @@
 - Serialize callbacks through a bounded application queue with terminal backpressure.
 - Replace the listener test peer with a private Go-role listener covering EC-001 through EC-025.
 - Add Debug and Release presets for Windows, Linux, and macOS plus Linux address/undefined and thread sanitizer presets.
+- Make Windows, Linux, macOS, address/undefined sanitizer, thread sanitizer,
+  conformance, and Go interoperability checks mandatory CI gates against one
+  immutable specification revision.
 - Rename the example from `cpp_server` to `cpp_engine`.
 
 ## 0.2.0 - 2026-07-26

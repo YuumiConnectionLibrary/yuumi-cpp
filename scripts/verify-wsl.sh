@@ -20,7 +20,7 @@ if [[ "$actual_commit" != "$vcpkg_commit" ]]; then
 fi
 
 "$vcpkg_root/bootstrap-vcpkg.sh" -disableMetrics
-cmake --preset wsl-clang-debug -S "$repository"
+cd "$repository"
+cmake --preset wsl-clang-debug
 cmake --build --preset wsl-clang-debug-build
 ctest --preset wsl-clang-debug-test --output-on-failure
-

@@ -128,3 +128,6 @@ a test target and is not installed.
 ## Issues
 
 Protocol questions belong in [yuumi-spec](https://github.com/YuumiConnectionLibrary/yuumi-spec/issues). C++ SDK defects belong in this repository.
+
+The required CI matrix, sanitizer coverage, immutable spec pin, artifacts,
+timeout, cleanup, and local equivalents are documented in [`CI.md`](CI.md).

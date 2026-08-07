@@ -132,7 +132,7 @@ if(YUUMI_BUILD_TESTS)
             COMMAND
                 ${CMAKE_COMMAND} -E env
                 "YUUMI_INTEROP_COMMAND={\"executable\":\"$<TARGET_FILE:yuumi_interop_engine>\",\"arguments\":[],\"engine\":\"cpp\"}"
-                go test -tags=interop -run ^TestGoEngineInterop$ -count=1 -timeout 150s
+                go test -v -tags=interop -run ^TestGoEngineInterop$ -count=1 -timeout 150s
         )
         set_tests_properties(
             yuumi_go_integration
